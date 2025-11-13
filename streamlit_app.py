@@ -1,4 +1,3 @@
-
 import re
 from io import BytesIO
 from difflib import SequenceMatcher
@@ -14,13 +13,13 @@ from openpyxl.styles import PatternFill
 # =============================
 st.set_page_config(page_title="WALMART Masterfile Filler — Simple Mapping", layout="wide")
 
-# Target tabs we will write to (if present in template)
+# Target tabs we will write to (if present in template) — keys are canonical (normalized)
 TARGET_SHEETS_CANON = {
     "productcontentandsiteexp": "Product Content And Site Exp",
     "tradeitemconfigurations": "Trade Item Configurations",
 }
 
-# >>> Walmart template specifics
+# Walmart template specifics
 # Map using titles in ROW 5; write data starting on ROW 7.
 HEADER_ROW_INDEX = 5
 DATA_START_ROW = 7
@@ -53,15 +52,13 @@ def _enforce_extension(filename: str, is_xlsm: bool) -> str:
     return filename
 
 def _find_target_sheets(actual_names: List[str]) -> Dict[str, str]:
-    """Return mapping canon_key -> actual sheet name for present target sheets, with tolerant matching."""
-    present = {}
+    """Return mapping canon_key -> actual sheet name for present target sheets, tolerant to minor name variations."""
+    present: Dict[str, str] = {}
     norm_actual = { _norm_key(n): n for n in actual_names }
     for canon_norm, display in TARGET_SHEETS_CANON.items():
-        # exact normalized match
         if canon_norm in norm_actual:
             present[canon_norm] = norm_actual[canon_norm]
             continue
-        # fallback: partial contains
         for n_norm, real in norm_actual.items():
             if canon_norm in n_norm or n_norm in canon_norm:
                 present[canon_norm] = real
@@ -69,7 +66,7 @@ def _find_target_sheets(actual_names: List[str]) -> Dict[str, str]:
     return present
 
 def _extract_headers_row(ws, header_row: int) -> Tuple[List[str], Dict[str, int]]:
-    """Read the header row into a list and a normalized->column index map (1-based)."""
+    """Read the header row into list and normalized->column index map (1-based)."""
     headers: List[str] = []
     norm_to_col: Dict[str, int] = {}
     for col_idx, cell in enumerate(ws[header_row], start=1):
@@ -81,79 +78,81 @@ def _extract_headers_row(ws, header_row: int) -> Tuple[List[str], Dict[str, int]
         norm_to_col[_norm_key(val_str)] = col_idx
     return headers, norm_to_col
 
-def _touch_tick(sheet_key: str, templ_norm: str):
-    st.session_state["last_edit_tick"] = st.session_state.get("last_edit_tick", 0) + 1
-    st.session_state[f"tick_{sheet_key}_{templ_norm}"] = st.session_state["last_edit_tick"]
+# ---------- stable per-occurrence keys (fix duplicate header collisions) ----------
+def _map_key(sheet_key: str, templ_norm: str, ordinal: int) -> str:
+    return f"map_{sheet_key}_{templ_norm}__{ordinal}"
 
-def _make_on_change(sheet_key: str, templ_norm: str):
-    def _cb():
-        _touch_tick(sheet_key, templ_norm)
-    return _cb
+def _tick_key(sheet_key: str, templ_norm: str, ordinal: int) -> str:
+    return f"tick_{sheet_key}_{templ_norm}__{ordinal}"
 
-def _build_live_mapping_for_sheet(sheet_key: str, templ_headers: List[str]) -> List[Dict[str, str]]:
-    """Gather current on-screen mapping (session live state) for a given sheet; skip blanks."""
-    records = []
+def _iter_template_occurrences(sheet_key: str, templ_headers: List[str]):
+    """
+    Yield tuples (t, templ_norm, ordinal, map_key, tick_key) for each header, where
+    'ordinal' disambiguates duplicates of the same normalized header within a sheet.
+    """
+    seen: Dict[str, int] = {}
     for t in templ_headers:
         templ_norm = _norm_key(t)
-        k = f"map_{sheet_key}_{templ_norm}"
-        raw = st.session_state.get(k, "") or ""
+        seen[templ_norm] = seen.get(templ_norm, 0) + 1
+        ordinal = seen[templ_norm]
+        yield t, templ_norm, ordinal, _map_key(sheet_key, templ_norm, ordinal), _tick_key(sheet_key, templ_norm, ordinal)
+
+def _touch_tick(sheet_key: str, templ_norm: str, ordinal: int):
+    st.session_state["last_edit_tick"] = st.session_state.get("last_edit_tick", 0) + 1
+    st.session_state[_tick_key(sheet_key, templ_norm, ordinal)] = st.session_state["last_edit_tick"]
+
+def _make_on_change(sheet_key: str, templ_norm: str, ordinal: int):
+    def _cb():
+        _touch_tick(sheet_key, templ_norm, ordinal)
+    return _cb
+
+# ---------- mapping collectors ----------
+def _build_live_mapping_for_sheet(sheet_key: str, templ_headers: List[str]) -> List[Dict[str, str]]:
+    """Gather current (live) mapping for a sheet; skip blanks."""
+    records = []
+    for t, templ_norm, ordinal, mkey, tkey in _iter_template_occurrences(sheet_key, templ_headers):
+        raw = st.session_state.get(mkey, "") or ""
         if raw:
             records.append({
                 "template_header": t,
                 "template_norm": templ_norm,
+                "ordinal": ordinal,
                 "raw_header": raw,
-                "tick": st.session_state.get(f"tick_{sheet_key}_{templ_norm}", 0),
+                "tick": st.session_state.get(tkey, 0),
             })
     return records
 
-def _commit_current_sheet_mapping(sheet_key: str, templ_headers: List[str]):
-    """Snapshot the current (live) mapping for the selected sheet into a 'saved' store in session_state."""
-    recs = _build_live_mapping_for_sheet(sheet_key, templ_headers)
-    saved = st.session_state.setdefault("saved_mapping", {})
-    saved[sheet_key] = recs
-    st.session_state["saved_mapping"] = saved  # assign back to trigger Streamlit state update
-
-def _get_saved_mapping_for_sheet(sheet_key: str) -> List[Dict[str, str]]:
-    """Return saved mapping records for sheet_key if present, else empty list."""
-    saved = st.session_state.get("saved_mapping", {})
-    return list(saved.get(sheet_key, []))
-
+# ---------- automap ----------
 def _auto_map_exact(sheet_key: str, templ_headers: List[str], raw_headers: List[str]):
-    """Fill blanks where normalized names match exactly."""
     raw_norm_index = { _norm_key(r): r for r in raw_headers }
-    for t in templ_headers:
-        templ_norm = _norm_key(t)
-        k = f"map_{sheet_key}_{templ_norm}"
-        if not st.session_state.get(k, ""):
+    for t, templ_norm, ordinal, mkey, _ in _iter_template_occurrences(sheet_key, templ_headers):
+        if not st.session_state.get(mkey, ""):
             match = raw_norm_index.get(templ_norm)
             if match:
-                st.session_state[k] = match
-                _touch_tick(sheet_key, templ_norm)
+                st.session_state[mkey] = match
+                _touch_tick(sheet_key, templ_norm, ordinal)
 
 def _auto_map_fuzzy(sheet_key: str, templ_headers: List[str], raw_headers: List[str], threshold: int = 80):
-    """Fill blanks where similarity >= threshold (0–100) using SequenceMatcher."""
     thr = max(0, min(100, threshold)) / 100.0
     raw_norms = [(r, _norm_key(r)) for r in raw_headers]
-    for t in templ_headers:
-        templ_norm = _norm_key(t)
-        k = f"map_{sheet_key}_{templ_norm}"
-        if st.session_state.get(k, ""):
-            continue  # blanks only
-        best_raw = None
-        best_score = 0.0
+    for t, templ_norm, ordinal, mkey, _ in _iter_template_occurrences(sheet_key, templ_headers):
+        if st.session_state.get(mkey, ""):
+            continue  # fill blanks only
+        best_raw, best_score = None, 0.0
         for r, rnorm in raw_norms:
             score = SequenceMatcher(None, templ_norm, rnorm).ratio()
             if score > best_score:
                 best_score, best_raw = score, r
         if best_raw and best_score >= thr:
-            st.session_state[k] = best_raw
-            _touch_tick(sheet_key, templ_norm)
+            st.session_state[mkey] = best_raw
+            _touch_tick(sheet_key, templ_norm, ordinal)
 
+# ---------- import / export ----------
 def _import_mapping(df: pd.DataFrame, apply_sheet_key: Optional[str],
                     present_sheets: Dict[str, str],
                     templ_headers_by_sheet: Dict[str, List[str]],
                     raw_headers: List[str]) -> int:
-    """Import mapping from CSV/XLSX with columns: Template, Raw, [Sheet]. Case-insensitive column names."""
+    """Import mapping rows. Columns: Template, Raw, [Sheet] (case-insensitive)."""
     cols = { _norm_key(c): c for c in df.columns }
     tcol = next((cols[c] for c in ["template","templateheader","templ","target","targetheader"] if c in cols), None)
     rcol = next((cols[c] for c in ["raw","rawheader","source","sourceheader"] if c in cols), None)
@@ -169,35 +168,51 @@ def _import_mapping(df: pd.DataFrame, apply_sheet_key: Optional[str],
         if not templ or not raw or raw not in raw_set:
             continue
 
-        # Determine target sheets
+        # which sheets to apply to?
         if scol and pd.notna(row[scol]):
             norm_s = _norm_key(str(row[scol]).strip())
-            target_sheet_keys = [sk for sk in present_sheets.keys() if norm_s == sk or norm_s in sk or sk in norm_s]
-            if not target_sheet_keys:
+            targets = [sk for sk in present_sheets.keys() if norm_s == sk or norm_s in sk or sk in norm_s]
+            if not targets:
                 continue
         else:
-            target_sheet_keys = [apply_sheet_key] if apply_sheet_key else list(present_sheets.keys())
+            targets = [apply_sheet_key] if apply_sheet_key else list(present_sheets.keys())
 
-        for sk in target_sheet_keys:
-            templ_set = set(templ_headers_by_sheet.get(sk, []))
-            if templ in templ_set:
-                mk = f"map_{sk}_{_norm_key(templ)}"
-                st.session_state[mk] = raw
-                _touch_tick(sk, _norm_key(templ))
-                count += 1
+        for sk in targets:
+            templ_headers = templ_headers_by_sheet.get(sk, [])
+            # assign to the first occurrence of this header that's blank; else first occurrence
+            assigned = False
+            for t, templ_norm, ordinal, mkey, _ in _iter_template_occurrences(sk, templ_headers):
+                if t == templ and not st.session_state.get(mkey, ""):
+                    st.session_state[mkey] = raw
+                    _touch_tick(sk, templ_norm, ordinal)
+                    count += 1
+                    assigned = True
+                    break
+            if not assigned:
+                # fallback: first occurrence
+                for t, templ_norm, ordinal, mkey, _ in _iter_template_occurrences(sk, templ_headers):
+                    if t == templ:
+                        st.session_state[mkey] = raw
+                        _touch_tick(sk, templ_norm, ordinal)
+                        count += 1
+                        break
     return count
 
 def _export_mapping_df(present_sheets: Dict[str, str],
-                       templ_headers_by_sheet: Dict[str, List[str]]) -> pd.DataFrame:
+                       templ_headers_by_sheet: Dict[str, List[str]],
+                       only_sheet_key: Optional[str] = None) -> pd.DataFrame:
     rows = []
     for sk, actual_name in present_sheets.items():
-        for t in templ_headers_by_sheet.get(sk, []):
-            v = st.session_state.get(f"map_{sk}_{_norm_key(t)}", "")
-            rows.append({"Sheet": actual_name, "Template": t, "Raw": v})
+        if only_sheet_key and sk != only_sheet_key:
+            continue
+        templ_headers = templ_headers_by_sheet.get(sk, [])
+        for t, templ_norm, ordinal, mkey, _ in _iter_template_occurrences(sk, templ_headers):
+            v = st.session_state.get(mkey, "")
+            rows.append({"Sheet": actual_name, "Template": t, "Ordinal": ordinal, "Raw": v})
     return pd.DataFrame(rows)
 
+# ---------- duplicate RAW selection handling ----------
 def _resolve_duplicate_raw_mappings(records: List[Dict[str, str]], auto_resolve: bool) -> Tuple[List[Dict[str, str]], List[str]]:
-    """Detect duplicate RAW selections across template rows; optionally resolve with latest edit wins."""
     bucket: Dict[str, List[Dict[str, str]]] = {}
     for r in records:
         bucket.setdefault(r["raw_header"], []).append(r)
@@ -216,26 +231,25 @@ def _resolve_duplicate_raw_mappings(records: List[Dict[str, str]], auto_resolve:
     else:
         return records, dups
 
+# ---------- writing ----------
 def _write_sheet_data(ws, mapping: List[Dict[str, str]],
                       header_row: int,
                       start_row: int,
                       raw_df: pd.DataFrame,
                       dup_headers_to_highlight: List[str]) -> Tuple[int, List[str]]:
     """Write mapped data and highlight duplicate values in specified columns (by header)."""
-    # Map normalized header -> column index from the sheet's header row
     _, norm_to_col = _extract_headers_row(ws, header_row)
 
-    # Keep only mappings that actually exist in the sheet
+    # keep only mappings that exist in the sheet
     to_write = []
-    missing_template_headers = []
+    missing = []
     for m in mapping:
         templ_norm = _norm_key(m["template_header"])
         if templ_norm in norm_to_col:
             to_write.append((norm_to_col[templ_norm], m["raw_header"]))
         else:
-            missing_template_headers.append(m["template_header"])
+            missing.append(m["template_header"])
 
-    # Write data rows (row start_row+)
     nrows = len(raw_df)
     for i in range(nrows):
         excel_row = start_row + i
@@ -243,7 +257,7 @@ def _write_sheet_data(ws, mapping: List[Dict[str, str]],
             val = raw_df.iloc[i][raw_name] if raw_name in raw_df.columns else None
             ws.cell(row=excel_row, column=col_idx, value=val)
 
-    # Highlight duplicates in specified columns
+    # highlight duplicates
     dup_norms = [_norm_key(x) for x in dup_headers_to_highlight if str(x).strip()]
     for want_norm in dup_norms:
         if want_norm not in norm_to_col:
@@ -267,38 +281,36 @@ def _write_sheet_data(ws, mapping: List[Dict[str, str]],
             if str(v) in dup_values:
                 cell.fill = YELLOW_DUP_FILL
 
-    return nrows, missing_template_headers
+    return nrows, missing
 
 def _build_output_bytes(template_bytes: bytes,
                         template_is_xlsm: bool,
-                        present_sheets: Dict[str, str],
+                        sheets_to_process: Dict[str, str],
                         templ_headers_by_sheet: Dict[str, List[str]],
                         raw_df: pd.DataFrame,
                         auto_resolve_dupe_mappings: bool,
                         dup_columns_to_highlight: List[str],
                         saved_mapping_store: Optional[Dict[str, List[Dict[str, str]]]] = None) -> bytes:
-    """Write the raw data into the template (only target sheets), preserving formatting, validation, and macros.
-
-    If saved_mapping_store is provided and contains a sheet's mapping, it is used;
-    otherwise the current live mapping state is used.
+    """
+    Write raw data into the template for the chosen sheets, preserving formatting/validations/macros.
+    If saved_mapping_store is provided, use it per sheet; else use live mapping.
     """
     bio_in = BytesIO(template_bytes)
     wb = load_workbook(bio_in, read_only=False, keep_vba=template_is_xlsm, data_only=False)
 
-    for sk, actual_name in present_sheets.items():
+    for sk, actual_name in sheets_to_process.items():
         ws = wb[actual_name]
-
         if saved_mapping_store and sk in saved_mapping_store:
             mapping_records = list(saved_mapping_store[sk])
         else:
             mapping_records = _build_live_mapping_for_sheet(sk, templ_headers_by_sheet.get(sk, []))
 
-        # Resolve duplicate RAW column selections at download time
-        mapping_resolved, dup_raw_choices = _resolve_duplicate_raw_mappings(mapping_records, auto_resolve_dupe_mappings)
-        if dup_raw_choices:
-            dup_list = ", ".join(sorted(set(dup_raw_choices)))
-            raise ValueError(f"Duplicate RAW column selections for sheet '{actual_name}': {dup_list}. "
-                             f"Turn ON auto‑resolve or change your selections.")
+        mapping_resolved, dup_raw = _resolve_duplicate_raw_mappings(mapping_records, auto_resolve_dupe_mappings)
+        if dup_raw:
+            raise ValueError(
+                f"Duplicate RAW column selections for sheet '{actual_name}': {', '.join(sorted(set(dup_raw)))}. "
+                "Turn ON auto‑resolve or change your selections."
+            )
 
         _write_sheet_data(
             ws=ws,
@@ -310,7 +322,7 @@ def _build_output_bytes(template_bytes: bytes,
         )
 
     bio_out = BytesIO()
-    wb.save(bio_out)  # preserves formatting, row heights, colors, validations; keep_vba preserves macros
+    wb.save(bio_out)  # preserves formatting, heights, colors, validations; keep_vba preserves macros
     return bio_out.getvalue()
 
 # =============================
@@ -328,7 +340,7 @@ for k, v in [
     ("current_sheet_key", None),
     ("last_edit_tick", 0),
     ("download_payload", None),
-    ("saved_mapping", {}),  # NEW: committed/saved mapping snapshots per sheet
+    ("saved_mapping", {}),  # snapshots per sheet when you click "Save mapping"
 ]:
     st.session_state.setdefault(k, v)
 
@@ -367,14 +379,11 @@ with tab1:
         raw_bytes = tpl.read()
         is_xlsm = tpl.name.lower().endswith(".xlsm")
 
-        # Load workbook and discover target sheets and their ROW 5 headers
         wb = load_workbook(BytesIO(raw_bytes), read_only=False, keep_vba=is_xlsm, data_only=False)
         all_names = wb.sheetnames
 
-        # Which target sheets are present?
         present = _find_target_sheets(all_names)
 
-        # Extract headers for each present target sheet from ROW 5
         templ_headers_by_sheet: Dict[str, List[str]] = {}
         templ_header_sigs: Dict[str, str] = {}
         for sk, actual in present.items():
@@ -383,7 +392,6 @@ with tab1:
             templ_headers_by_sheet[sk] = headers
             templ_header_sigs[sk] = "|".join(headers)
 
-        # Persist in session
         prev_sigs = st.session_state.get("templ_header_sigs", {})
         st.session_state["template_bytes"] = raw_bytes
         st.session_state["template_ext"] = "xlsm" if is_xlsm else "xlsx"
@@ -391,7 +399,7 @@ with tab1:
         st.session_state["templ_headers_by_sheet"] = templ_headers_by_sheet
         st.session_state["templ_header_sigs"] = templ_header_sigs
 
-        # If headers changed for a sheet, clear only that sheet's mapping keys (live + saved)
+        # Clear only sheets whose header signature changed (both map_ and tick_ keys; also saved snapshots)
         for sk, sig in templ_header_sigs.items():
             if prev_sigs.get(sk) != sig:
                 p_map = f"map_{sk}_"
@@ -399,15 +407,12 @@ with tab1:
                 for k in list(st.session_state.keys()):
                     if k.startswith(p_map) or k.startswith(p_tick):
                         del st.session_state[k]
-                # Also clear any saved snapshot for that sheet
                 if sk in st.session_state["saved_mapping"]:
                     del st.session_state["saved_mapping"][sk]
 
-        # Default selected sheet
         if st.session_state["current_sheet_key"] not in present:
             st.session_state["current_sheet_key"] = next(iter(present.keys()), None)
 
-        # Status
         st.success("Template loaded.")
         if present:
             st.write("Detected target sheets:")
@@ -434,7 +439,6 @@ with tab2:
             sheetname = st.selectbox("Choose a sheet", xl.sheet_names, index=0)
             raw_df = xl.parse(sheetname)
 
-        # Use string headers
         raw_df.columns = [str(c) for c in raw_df.columns]
         new_headers = list(raw_df.columns)
         new_sig = "|".join(new_headers)
@@ -443,11 +447,10 @@ with tab2:
         removed = set(st.session_state.get("raw_prev_headers", [])) - set(new_headers)
         if removed:
             for sk in st.session_state.get("present_sheets", {}).keys():
-                for t in st.session_state.get("templ_headers_by_sheet", {}).get(sk, []):
-                    mk = f"map_{sk}_{_norm_key(t)}"
-                    if st.session_state.get(mk, "") in removed:
-                        st.session_state[mk] = ""
-                # prune saved mapping recs that refer to removed raw headers
+                templ_headers = st.session_state.get("templ_headers_by_sheet", {}).get(sk, [])
+                for _, _, ordinal, mkey, _ in _iter_template_occurrences(sk, templ_headers):
+                    if st.session_state.get(mkey, "") in removed:
+                        st.session_state[mkey] = ""
                 if "saved_mapping" in st.session_state and sk in st.session_state["saved_mapping"]:
                     st.session_state["saved_mapping"][sk] = [
                         r for r in st.session_state["saved_mapping"][sk] if r.get("raw_header") not in removed
@@ -484,7 +487,7 @@ with tab3:
         st.error("Template has no target sheets to map (expected PCSE and/or TIC).")
         st.stop()
 
-    # Switch target sheet for mapping
+    # Choose target sheet to map (UI only; mappings persist for both)
     display_names = [TARGET_SHEETS_CANON.get(sk, present[sk]) for sk in present.keys()]
     key_by_display = { TARGET_SHEETS_CANON.get(sk, present[sk]): sk for sk in present.keys() }
 
@@ -503,15 +506,16 @@ with tab3:
     with left:
         st.markdown(f"**Template Headers (from row {HEADER_ROW_INDEX})**")
         if templ_headers:
-            st.dataframe(pd.DataFrame({"Template Header": templ_headers}), use_container_width=True, height=420)
+            st.dataframe(pd.DataFrame({"Template Header": templ_headers}), use_container_width=True, height=400)
         else:
             st.write(f"No headers detected on row {HEADER_ROW_INDEX} of this sheet.")
 
-        # Show saved status for both sheets
+        # Saved mapping status
         st.markdown("**Saved mapping status**")
+        saved = st.session_state.get("saved_mapping", {})
         for sk, actual in present.items():
             total = len(templ_headers_by_sheet.get(sk, []))
-            saved_count = len(_get_saved_mapping_for_sheet(sk))
+            saved_count = len(saved.get(sk, []))
             st.caption(f"{TARGET_SHEETS_CANON.get(sk, actual)}: {saved_count} saved of {total} headers")
 
     with mid:
@@ -520,10 +524,8 @@ with tab3:
             st.warning("Upload raw data first.")
         else:
             options = [""] + raw_headers
-            for t in templ_headers:
-                t_norm = _norm_key(t)
-                key = f"map_{sheet_key}_{t_norm}"
-                current_val = st.session_state.get(key, "")
+            for t, templ_norm, ordinal, mkey, tkey in _iter_template_occurrences(sheet_key, templ_headers):
+                current_val = st.session_state.get(mkey, "")
                 try:
                     idx = options.index(current_val) if current_val in options else 0
                 except ValueError:
@@ -532,13 +534,12 @@ with tab3:
                     label=t,
                     options=options,
                     index=idx,
-                    key=key,
-                    on_change=_make_on_change(sheet_key, t_norm),
+                    key=mkey,  # unique per occurrence now
+                    on_change=_make_on_change(sheet_key, templ_norm, ordinal),
                 )
 
     with right:
         st.markdown("**Tools**")
-        # Auto map tools
         if st.button("Auto‑map (exact)", use_container_width=True):
             _auto_map_exact(sheet_key, templ_headers, raw_headers)
             st.toast("Exact auto‑map applied (blanks only).")
@@ -567,11 +568,19 @@ with tab3:
 
         st.markdown("---")
         st.markdown("**Export mapping (CSV)**")
-        export_df = _export_mapping_df(present, templ_headers_by_sheet)
+        export_df_all = _export_mapping_df(present, templ_headers_by_sheet)
         st.download_button(
-            "Export current mapping",
-            data=export_df.to_csv(index=False).encode("utf-8"),
-            file_name="mapping_export.csv",
+            "Export mapping (all sheets)",
+            data=export_df_all.to_csv(index=False).encode("utf-8"),
+            file_name="mapping_export_all.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
+        export_df_selected = _export_mapping_df(present, templ_headers_by_sheet, only_sheet_key=sheet_key)
+        st.download_button(
+            "Export mapping (selected sheet)",
+            data=export_df_selected.to_csv(index=False).encode("utf-8"),
+            file_name=f"mapping_export_{TARGET_SHEETS_CANON.get(sheet_key, sheet_key)}.csv",
             mime="text/csv",
             use_container_width=True,
         )
@@ -582,7 +591,7 @@ with tab3:
             value=True,
             key="auto_resolve_dupe_mappings"
         )
-        # Default duplicate columns for Walmart
+
         dup_cols_text = st.text_input(
             "Duplicate columns to highlight (comma‑separated)",
             value="SKU, productId, manufacturerPartNumber"
@@ -596,27 +605,51 @@ with tab3:
         final_name = _enforce_extension(file_name_input, is_xlsm=is_xlsm)
 
         st.markdown("---")
-        # NEW: Save mapping for the selected sheet (explicit)
+        # ---- Save & Build controls ----
         if st.button("Save mapping (selected sheet)", use_container_width=True):
-            _commit_current_sheet_mapping(sheet_key, templ_headers)
+            # Snapshot current sheet mapping into saved store
+            recs = _build_live_mapping_for_sheet(sheet_key, templ_headers)
+            saved = st.session_state.get("saved_mapping", {})
+            saved[sheet_key] = recs
+            st.session_state["saved_mapping"] = saved
             st.success(f"Saved mapping for '{TARGET_SHEETS_CANON.get(sheet_key, present.get(sheet_key, sheet_key))}'.")
 
-        # NEW: Save current sheet and then build file for ALL target sheets
         if st.button("Save & Build (process both sheets)", use_container_width=True):
             try:
-                # 1) Commit the currently selected sheet's mapping
-                _commit_current_sheet_mapping(sheet_key, templ_headers)
+                # Save current sheet mapping first
+                recs = _build_live_mapping_for_sheet(sheet_key, templ_headers)
+                saved = st.session_state.get("saved_mapping", {})
+                saved[sheet_key] = recs
+                st.session_state["saved_mapping"] = saved
 
-                # 2) Build using saved mapping where available; fallback to live otherwise
                 payload = _build_output_bytes(
                     template_bytes=st.session_state["template_bytes"],
                     template_is_xlsm=is_xlsm,
-                    present_sheets=present,  # always process all target sheets
+                    sheets_to_process=present,  # process both/all detected target sheets
                     templ_headers_by_sheet=templ_headers_by_sheet,
                     raw_df=raw_df,
                     auto_resolve_dupe_mappings=auto_resolve,
                     dup_columns_to_highlight=dup_cols,
                     saved_mapping_store=st.session_state.get("saved_mapping", {}),
+                )
+                st.session_state["download_payload"] = payload
+                st.success("File prepared. Use the download button below.")
+            except ValueError as ve:
+                st.error(str(ve))
+            except Exception as e:
+                st.error(f"Failed to build file: {e}")
+
+        if st.button("Build (selected sheet only)", use_container_width=True):
+            try:
+                payload = _build_output_bytes(
+                    template_bytes=st.session_state["template_bytes"],
+                    template_is_xlsm=is_xlsm,
+                    sheets_to_process={sheet_key: present[sheet_key]},
+                    templ_headers_by_sheet=templ_headers_by_sheet,
+                    raw_df=raw_df,
+                    auto_resolve_dupe_mappings=auto_resolve,
+                    dup_columns_to_highlight=dup_cols,
+                    saved_mapping_store=None,  # use live mapping for selected sheet
                 )
                 st.session_state["download_payload"] = payload
                 st.success("File prepared. Use the download button below.")
@@ -637,9 +670,10 @@ with tab3:
 # =============================
 # Notes
 # - Headers read from ROW 5; data written from ROW 7.
-# - Only PCSE/TIC sheets are edited; Data Definitions remains untouched.
+# - Keys for dropdowns are unique per repeated header (ordinal suffix) to avoid StreamlitDuplicateElementKey.
+# - You can map both sheets; mappings are saved per sheet via "Save mapping".
+# - "Save & Build" saves the selected sheet mapping and writes BOTH sheets into the output (uses saved mappings).
+# - "Build (selected sheet only)" writes only the visible sheet using current live selections.
 # - Formatting, colors, merges, row heights, data validation (dropdowns), and macros are preserved.
-# - No live uniqueness enforcement; duplicate RAW mapping handled on download.
 # - Duplicate value highlighting defaults to SKU, productId, manufacturerPartNumber.
-# - NEW: "Save mapping (selected sheet)" commits the current sheet's mapping; "Save & Build" processes both sheets.
 # =============================
