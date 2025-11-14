@@ -32,7 +32,7 @@ st.set_page_config(page_title="Walmart Masterfile Filler", layout="wide")
 st.markdown(
     """
     <div style="text-align:center; margin-top:-0.5rem; margin-bottom:0.5rem;">
-      <h1 style="margin-bottom:0.25rem;">Walmart Masterfile Filler</h1>
+      <h1 style="margin-bottom:0.25rem;">Walmart Masterfile Filler 2</h1>
       <p style="margin-top:0; font-size:1.05rem;">Empowering Innovation ⏐ Maximizing Performance</p>
     </div>
     """,
