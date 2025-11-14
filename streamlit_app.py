@@ -1,10 +1,11 @@
 # streamlit_app.py
-# Walmart Masterfile Filler — Horizontal Mapping with High‑Fidelity Header Preview (Rows 2–6, no inner scroll)
-# - Styled preview shows rows 2–6 "as-is" (merged cells, fills, fonts/alignment approximated) without its own scrollbar
-# - Horizontal mapping row (one dropdown per template column) directly beneath the preview in the same section
-# - Supports composite (multi-row) headers for mapping
-# - Preserves macros/formatting/validations on export; writes from row 7 (configurable)
-# - Auto-save mapping on sheet switch, fuzzy/exact automap, one workbook importer (PCSE/TIC), duplicate highlighting
+# Walmart Masterfile Filler — Unified Preview (Rows 2–4 only) + Horizontal Mapping
+# - Preview shows ONLY rows 2–4. Row 1 and Row 6 are never shown. Row 5 stays hidden if the sheet hides it.
+# - Preview is colorful (solid fills) with theme/tint/indexed color support; merged cells, fonts, and alignment approximated.
+# - Preview and the horizontal mapping row live in ONE unified section with ONE horizontal scroll.
+# - Mapping still uses your chosen header rows (default: 5), so hidden row 5 can remain your mapping header.
+# - Preserves .xlsm macros/validations/formatting; writes from row 7 by default (configurable).
+# - Auto-save mapping on sheet switch; import workbook (PCSE/TIC); duplicate highlighting.
 
 import re
 from io import BytesIO
@@ -48,14 +49,15 @@ MAPPING_TAB_SYNONYMS = {
 }
 
 # Defaults
-DEFAULT_HEADER_ROWS = [5]   # you can change in UI (e.g., 3,4,5 for composite headers)
+DEFAULT_HEADER_ROWS = [5]   # header(s) used for mapping (row 5 can stay hidden visually)
 DEFAULT_DATA_START_ROW = 7  # write from row 7 by default
 
-# Highlight style for duplicate cells (in exported Excel)
+# Duplicate highlighting style in exported workbook
 YELLOW_DUP_FILL = PatternFill(start_color="FFFF00", end_color="FFFF00", fill_type="solid")
 
+
 # =============================
-# Utilities
+# Helpers
 # =============================
 def _norm_key(s: str) -> str:
     if s is None:
@@ -94,7 +96,7 @@ def _find_target_sheets(actual_names: List[str]) -> Dict[str, str]:
                 break
     return present
 
-# ---------- Excel reading helpers ----------
+# ---------- Excel reading ----------
 def _get_cell_value_with_merge(ws, row: int, col: int):
     cell = ws.cell(row=row, column=col)
     if cell.value not in (None, ""):
@@ -106,10 +108,10 @@ def _get_cell_value_with_merge(ws, row: int, col: int):
 
 def _extract_headers_composite(ws, header_rows: List[int]) -> Tuple[List[str], Dict[int, int], Dict[str, List[int]]]:
     """
-    Build composite headers by combining texts in multiple header rows for each column.
-      - headers: ordered list of composite header strings (for columns with any header text)
-      - pos_to_col: mapping 1-based header position -> column index
-      - norm_to_cols: mapping normalized composite header -> list of actual column indexes
+    Build composite headers by combining texts in the given header rows per column.
+      - headers: ordered list of composite header strings (only for columns that have any header text)
+      - pos_to_col: mapping 1-based position -> actual column index
+      - norm_to_cols: normalized composite header -> list[actual column indexes]
     """
     headers: List[str] = []
     pos_to_col: Dict[int, int] = {}
@@ -130,23 +132,23 @@ def _extract_headers_composite(ws, header_rows: List[int]) -> Tuple[List[str], D
         pos_to_col[pos] = col_idx
         norm = _norm_key(composite)
         norm_to_cols.setdefault(norm, []).append(col_idx)
-
     return headers, pos_to_col, norm_to_cols
 
-# ---------- Color & size approximation for HTML preview ----------
+# ---------- Color + size approximation ----------
 THEME_COLOR_MAP = {
     0: "#FFFFFF", 1: "#000000", 2: "#EEECE1", 3: "#1F497D",
     4: "#4F81BD", 5: "#C0504D", 6: "#9BBB59", 7: "#8064A2", 8: "#4BACC6", 9: "#F79646",
 }
-INDEXED_COLOR_FALLBACK = {64: "#FFFFFF", 9: "#000000"}
+INDEXED_COLOR_FALLBACK = {64: "#FFFFFF", 9: "#000000"}  # 64=Automatic, 9=Black (common)
 
 def _apply_tint_to_hex(hex_color: str, tint: float) -> str:
     try:
         h = hex_color.lstrip("#")
         r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
         def adj(ch):
-            if tint < 0:
+            if tint < 0:  # darken
                 return int(ch * (1.0 + tint))
+            # lighten
             return int(ch + (255 - ch) * tint)
         r = min(255, max(0, adj(r)))
         g = min(255, max(0, adj(g)))
@@ -165,7 +167,7 @@ def _excel_color_to_hex(color) -> Optional[str]:
         if typ == "theme" and getattr(color, "theme", None) is not None:
             base = THEME_COLOR_MAP.get(color.theme)
             tint = getattr(color, "tint", 0.0) or 0.0
-            if base:
+            if base is not None:
                 return _apply_tint_to_hex(base, float(tint))
             return base
         if typ == "indexed" and getattr(color, "indexed", None) is not None:
@@ -175,26 +177,31 @@ def _excel_color_to_hex(color) -> Optional[str]:
     return None
 
 def _excel_col_width_to_pixels(width: Optional[float]) -> int:
+    # Excel approx: px ≈ (width + 0.72) * 7
     if width is None:
         width = 8.43
-    try:
-        return max(32, int(round((width + 0.72) * 7)))
-    except Exception:
-        return 64
+    return max(32, int(round((float(width) + 0.72) * 7)))
 
 def _excel_row_height_to_pixels(height: Optional[float]) -> int:
+    # 1pt = 1/72in; 96dpi => px = pt * 96/72
     if height is None:
         height = 15.0
-    try:
-        return max(16, int(round(height * 96.0 / 72.0)))
-    except Exception:
-        return 18
+    return max(16, int(round(float(height) * 96.0 / 72.0)))
 
-def _build_header_preview_html(ws, start_row: int = 2, num_rows: int = 5, max_cols: Optional[int] = None) -> Tuple[str, int]:
-    """Return (html, exact_pixel_height) for rows start_row..start_row+num_rows-1."""
+# ---------- Styled preview (ROWS 2–4 only, row 5 hidden honored) ----------
+def _build_header_preview_html(ws, visible_rows: List[int]) -> Tuple[str, int, List[int]]:
+    """
+    Build an HTML table for the given visible rows that respects:
+      - merged cells (rowspan/colspan)
+      - solid fills (background-color) with theme/tint/indexed support
+      - fonts (bold/italic/underline/color) and alignment
+      - column widths and row heights (approximated)
+    Returns: (html, table_height_px, col_widths_px_list)
+    """
+    # Filter out hidden rows
+    visible_rows = [r for r in visible_rows if not getattr(ws.row_dimensions.get(r, None), "hidden", False)]
+
     max_col = ws.max_column or 0
-    if max_cols is not None:
-        max_col = min(max_col, max_cols)
 
     # Precompute merged ranges
     top_left_to_span = {}
@@ -212,47 +219,53 @@ def _build_header_preview_html(ws, start_row: int = 2, num_rows: int = 5, max_co
     col_widths_px = []
     for c in range(1, max_col + 1):
         letter = get_column_letter(c)
-        w = ws.column_dimensions[letter].width
-        col_widths_px.append(_excel_col_width_to_pixels(w))
+        dim = ws.column_dimensions.get(letter)
+        col_widths_px.append(_excel_col_width_to_pixels(getattr(dim, "width", None)))
 
     # Total height
-    rows = range(start_row, start_row + num_rows)
-    total_height_px = sum(_excel_row_height_to_pixels(ws.row_dimensions[r].height) for r in rows) + 12  # padding
+    total_height_px = sum(_excel_row_height_to_pixels(ws.row_dimensions[r].height) for r in visible_rows) + 12
 
-    # Build HTML table
-    html_parts = []
-    html_parts.append(
+    # Build HTML
+    parts = []
+    parts.append(
         """
         <div style="max-width:100%; overflow-x:auto; border:1px solid #ddd; border-radius:6px; background:#fff;">
-        <table style="border-collapse:collapse; font-family:Arial, Helvetica, sans-serif; font-size:12px; width:max-content;">
-        <colgroup>
+          <table style="border-collapse:collapse; font-family:Arial, Helvetica, sans-serif; font-size:12px; width:max-content;">
+            <colgroup>
         """
     )
     for px in col_widths_px:
-        html_parts.append(f'<col style="width:{px}px;">')
-    html_parts.append("</colgroup><tbody>")
+        parts.append(f'<col style="width:{px}px;">')
+    parts.append("</colgroup><tbody>")
 
-    for r in rows:
+    for r in visible_rows:
         h_px = _excel_row_height_to_pixels(ws.row_dimensions[r].height)
-        html_parts.append(f'<tr style="height:{h_px}px;">')
-        for c in range(1, max_col + 1):
-            if (r, c) in covered:
+        parts.append(f'<tr style="height:{h_px}px;">')
+        c = 1
+        while c <= max_col:
+            # Skip interior of merged ranges (not top-left)
+            if (r, c) in covered and (r, c) not in top_left_to_span:
+                c += 1
                 continue
             cell = ws.cell(row=r, column=c)
 
-            # Span if merged top-left
+            # Span handling
             rs, cs = 1, 1
             if (r, c) in top_left_to_span:
                 rs_all, cs = top_left_to_span[(r, c)]
-                # clamp rowspan to our preview window
-                rs = max(1, min(rs_all, start_row + num_rows - r))
+                # clamp rowspan to our visible rows (2–4)
+                visible_set = set(visible_rows)
+                rs = sum(1 for rr in range(r, r + rs_all) if rr in visible_set)
 
-            # Background
+            # Background fill
             bg = None
             fill = getattr(cell, "fill", None)
-            if isinstance(fill, PatternFill) and getattr(fill, "fill_type", None) == "solid":
-                color_obj = getattr(fill, "fgColor", None) or getattr(fill, "start_color", None)
-                bg = _excel_color_to_hex(color_obj)
+            try:
+                if isinstance(fill, PatternFill) and getattr(fill, "fill_type", None) == "solid":
+                    color_obj = getattr(fill, "fgColor", None) or getattr(fill, "start_color", None)
+                    bg = _excel_color_to_hex(color_obj)
+            except Exception:
+                bg = None
 
             # Font & alignment
             font = cell.font
@@ -281,25 +294,22 @@ def _build_header_preview_html(ws, start_row: int = 2, num_rows: int = 5, max_co
                 "padding:4px 6px",
                 f"white-space:{'normal' if wrap else 'nowrap'}",
             ]
-            if fcolor:
-                styles.append(f"color:{fcolor}")
-            if bg:
-                styles.append(f"background-color:{bg}")
+            if fcolor: styles.append(f"color:{fcolor}")
+            if bg: styles.append(f"background-color:{bg}")
 
             value = _get_cell_value_with_merge(ws, r, c)
             text = "" if value in (None, "") else str(value)
             text = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
-            span_attrs = ""
-            if rs > 1:
-                span_attrs += f' rowspan="{rs}"'
-            if cs > 1:
-                span_attrs += f' colspan="{cs}"'
+            span = ""
+            if rs > 1: span += f' rowspan="{rs}"'
+            if cs > 1: span += f' colspan="{cs}"'
 
-            html_parts.append(f'<td{span_attrs} style="{";".join(styles)}">{text}</td>')
-        html_parts.append("</tr>")
-    html_parts.append("</tbody></table></div>")
-    return "".join(html_parts), total_height_px
+            parts.append(f'<td{span} style="{";".join(styles)}">{text}</td>')
+            c += cs
+        parts.append("</tr>")
+    parts.append("</tbody></table></div>")
+    return "".join(parts), total_height_px, col_widths_px
 
 # ---------- Widget key helpers ----------
 def _map_key(sheet_key: str, templ_norm: str, pos: int) -> str:
@@ -402,7 +412,6 @@ def _import_mapping_df_for_sheet(df: pd.DataFrame,
     rcol = next((cols[c] for c in ["raw","rawheader","source","sourceheader"] if c in cols), None)
     if not tcol or not rcol:
         return 0
-
     templ_headers = templ_headers_by_sheet.get(target_sheet_key, [])
     raw_set = set(raw_headers)
     applied = 0
@@ -495,7 +504,7 @@ def _write_sheet_data(ws, mapping: List[Dict[str, str]],
             val = raw_df.iloc[i][raw_name] if raw_name in raw_df.columns else None
             ws.cell(row=excel_row, column=col_idx, value=val)
 
-    # Highlight duplicates in the chosen columns (matched by composite header normalization)
+    # Duplicate highlighting
     dup_norms = [_norm_key(x) for x in dup_headers_to_highlight if str(x).strip()]
     for want_norm in dup_norms:
         match_cols = set()
@@ -558,10 +567,10 @@ def _build_output_bytes(template_bytes: bytes,
         )
 
     bio_out = BytesIO()
-    wb.save(bio_out)  # preserves formatting, heights, colors, validations; keep_vba preserves macros
+    wb.save(bio_out)  # preserves formatting/validations/macros; we only wrote values below headers
     return bio_out.getvalue()
 
-# ---------- Ordering / matching helpers ----------
+# ---------- Ordering helpers ----------
 def _ordered_keys(present_sheets: Dict[str, str]) -> List[str]:
     ordered = [k for k in CANON_ORDER if k in present_sheets]
     ordered += [k for k in present_sheets.keys() if k not in ordered]
@@ -625,7 +634,7 @@ st.components.v1.html(
 tab1, tab2, tab3 = st.tabs([
     "Upload Masterfile Template",
     "Upload Raw / Onboarding Data",
-    "Mapping (Horizontal) & Download",
+    "Unified Preview (Rows 2–4) + Mapping",
 ])
 
 # -----------------------------
@@ -640,7 +649,7 @@ with tab1:
         hdr_str = st.text_input(
             "Header rows to combine (comma‑separated, top→bottom)",
             value=hdr_str_default,
-            help="Example: 3,4,5 — texts in those rows (same column) are joined to form a composite header."
+            help="Example: 5  or  3,4,5. Row 5 may be hidden visually but still used for mapping headers."
         )
         st.session_state["header_rows"] = _parse_rows_input(hdr_str, DEFAULT_HEADER_ROWS)
     with c2:
@@ -700,7 +709,7 @@ with tab1:
 
         st.success("Template loaded & headers scanned.")
         if present:
-            st.caption(f"Composite headers from rows: {', '.join(str(r) for r in st.session_state['header_rows'])}. Data will be written from row {st.session_state['data_start_row']}.")
+            st.caption(f"Header rows for mapping: {', '.join(str(r) for r in st.session_state['header_rows'])}. Data will be written from row {st.session_state['data_start_row']}.")
             st.write("Detected target sheets:")
             for sk in _ordered_keys(present):
                 st.write(f"- **{TARGET_SHEETS_CANON.get(sk, present[sk])}** (actual: `{present[sk]}`)")
@@ -734,9 +743,7 @@ with tab2:
                     if k.startswith(f"map_{sk}_") and st.session_state.get(k, "") in removed:
                         st.session_state[k] = ""
                 if "saved_mapping" in st.session_state and sk in st.session_state["saved_mapping"]:
-                    st.session_state["saved_mapping"][sk] = [
-                        r for r in st.session_state["saved_mapping"][sk] if r.get("raw_header") not in removed
-                    ]
+                    st.session_state["saved_mapping"][sk] = [r for r in st.session_state["saved_mapping"][sk] if r.get("raw_header") not in removed]
 
         st.session_state["raw_prev_headers"] = new_headers
         st.session_state["raw_headers"] = new_headers
@@ -748,10 +755,10 @@ with tab2:
             st.dataframe(raw_df.head(20), use_container_width=True)
 
 # -----------------------------
-# Tab 3: Mapping (Horizontal) & Download
+# Tab 3: Unified Preview (Rows 2–4) + Mapping
 # -----------------------------
 with tab3:
-    st.markdown("#### Step 3 of 3 — Mapping (Horizontal) & Download")
+    st.markdown("#### Step 3 of 3 — Unified Preview (Rows 2–4) + Horizontal Mapping")
 
     if not st.session_state.get("template_bytes"):
         st.info("Please upload a masterfile template in tab 1.")
@@ -770,11 +777,11 @@ with tab3:
         st.error("Template has no target sheets to map (expected PCSE and/or TIC).")
         st.stop()
 
-    ordered_keys = _ordered_keys(present)
-    display_names = [TARGET_SHEETS_CANON.get(sk, present[sk]) for sk in ordered_keys]
-    key_by_display = { TARGET_SHEETS_CANON.get(sk, present[sk]): sk for sk in ordered_keys }
+    ordered = _ordered_keys(present)
+    display_names = [TARGET_SHEETS_CANON.get(sk, present[sk]) for sk in ordered]
+    key_by_display = { TARGET_SHEETS_CANON.get(sk, present[sk]): sk for sk in ordered }
 
-    current_key_before = st.session_state.get("current_sheet_key", ordered_keys[0])
+    current_key_before = st.session_state.get("current_sheet_key", ordered[0])
     default_index = 0
     if current_key_before in present:
         dname = TARGET_SHEETS_CANON.get(current_key_before, present.get(current_key_before, ""))
@@ -784,64 +791,84 @@ with tab3:
     selected_display = st.radio("Choose target sheet", options=display_names, index=default_index, horizontal=True)
     sheet_key = key_by_display[selected_display]
 
-    # Auto-save previous sheet mapping when switching
     if current_key_before != sheet_key and current_key_before in present:
         _commit_current_sheet_mapping(current_key_before, templ_headers_by_sheet.get(current_key_before, []))
     st.session_state["current_sheet_key"] = sheet_key
 
-    # Prepare mapping headers for this sheet
+    # Load selected sheet for preview/mapping
     is_xlsm = (st.session_state.get("template_ext", "xlsx") == "xlsm")
     wb = load_workbook(BytesIO(st.session_state["template_bytes"]), read_only=False, keep_vba=is_xlsm, data_only=False)
     ws = wb[present[sheet_key]]
 
-    templ_headers = templ_headers_by_sheet.get(sheet_key, [])
-    pos_to_col = pos_to_col_by_sheet.get(sheet_key, {})
+    # Build preview for rows 2–4 (row 5 & 6 not shown; row 5 stays hidden if the sheet hides it)
+    preview_rows = [2, 3, 4]
+    html_preview, exact_height, col_widths_px = _build_header_preview_html(ws, visible_rows=preview_rows)
 
-    # ---------- High-fidelity header preview (rows 2–6) with NO inner scroll ----------
-    st.markdown("**Template preview (rows 2–6)**")
-    html_preview, exact_height = _build_header_preview_html(ws, start_row=2, num_rows=5, max_cols=None)
-    # Render at the computed height; no inner scrolling -> single page scroll
+    # Display preview (no inner scrollbar) — page provides single horizontal scroll
     st.components.v1.html(html_preview, height=exact_height + 16, scrolling=False)
 
-    # Hydrate mapping UI from saved snapshot (only fill blanks)
+    # Prepare mapping headers & alignment
+    headers_for_map, pos_to_col, _ = _extract_headers_composite(ws, st.session_state["header_rows"])
+    templ_headers_by_sheet[sheet_key] = headers_for_map
+    pos_to_col_by_sheet[sheet_key] = pos_to_col
+    st.session_state["templ_headers_by_sheet"] = templ_headers_by_sheet
+    st.session_state["pos_to_col_by_sheet"] = pos_to_col_by_sheet
+
+    templ_headers = templ_headers_by_sheet.get(sheet_key, [])
     _hydrate_live_from_saved(sheet_key, templ_headers)
 
-    # ---------- Horizontal mapping row using Data Editor ----------
+    # CSS tweaks to make Data Editor expand to max-content width (single scroll with preview)
+    st.markdown(
+        """
+        <style>
+        /* Flatten Data Editor's horizontal scroll so the page provides ONE scrollbar */
+        div[data-testid="stDataFrame"] { overflow: visible !important; }
+        div[data-testid="stDataFrame"] > div { width: max-content !important; }
+        /* Give the editor a subtle border to visually connect with the preview */
+        div[data-testid="stDataFrame"] { border: 1px solid #ddd; border-radius: 6px; }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    # Horizontal mapping row (one select per template column), aligned by Excel column widths
     st.markdown("**Mapping row (choose a raw column for each template column)**")
     if not raw_headers:
         st.warning("Upload raw data first to enable mapping.")
     else:
-        # Build one-row DataFrame: columns are composite headers (display), values are current selections
         options = [""] + raw_headers
         initial = {}
         col_config = {}
         for t, templ_norm, pos, mkey, _ in _iter_template_positions(sheet_key, templ_headers):
-            col_letter = get_column_letter(pos_to_col.get(pos, 0)) if pos_to_col.get(pos, 0) else ""
+            col_idx = pos_to_col.get(pos, 0)
+            col_letter = get_column_letter(col_idx) if col_idx else ""
             label = f"{col_letter} {t}".strip()
             initial[label] = st.session_state.get(mkey, "")
+            width_px = col_widths_px[col_idx - 1] if col_idx and (col_idx - 1) < len(col_widths_px) else 120
             col_config[label] = st.column_config.SelectboxColumn(
                 label=label,
                 options=options,
                 required=False,
+                width=width_px,  # align visually under the preview's column widths
             )
-        seed_df = pd.DataFrame([initial]) if initial else pd.DataFrame([{}])
 
+        seed_df = pd.DataFrame([initial]) if initial else pd.DataFrame([{}])
         edited_df = st.data_editor(
             seed_df,
             column_config=col_config,
             hide_index=True,
-            use_container_width=True,
+            use_container_width=False,  # let width be dictated by per-column px widths
             num_rows="fixed",
             key=f"map_editor_{sheet_key}",
         )
 
-        # Push edits back to session_state mapping keys
+        # Push edits back into session state
         if isinstance(edited_df, pd.DataFrame) and len(edited_df) >= 1 and len(templ_headers) > 0:
             row0 = edited_df.iloc[0].to_dict()
-            # Build reverse lookup from editor label -> template header & pos
             label_to_pos = {}
             for t, templ_norm, pos, mkey, _ in _iter_template_positions(sheet_key, templ_headers):
-                col_letter = get_column_letter(pos_to_col.get(pos, 0)) if pos_to_col.get(pos, 0) else ""
+                col_idx = pos_to_col.get(pos, 0)
+                col_letter = get_column_letter(col_idx) if col_idx else ""
                 label = f"{col_letter} {t}".strip()
                 label_to_pos[label] = (t, templ_norm, pos, mkey)
             for label, val in row0.items():
@@ -854,7 +881,6 @@ with tab3:
                             _touch_tick(sheet_key, templ_norm, pos)
 
     st.markdown("---")
-    # Tools row
     c1, c2, c3 = st.columns((1, 1, 1))
     with c1:
         if st.button("Auto‑map (exact)", use_container_width=True):
@@ -876,7 +902,7 @@ with tab3:
         try:
             xl = pd.ExcelFile(imp_wb)
             applied_summary = []
-            for sk in ordered_keys:
+            for sk in ordered:
                 tab_name = _match_mapping_tab(xl.sheet_names, sk)
                 if not tab_name:
                     applied_summary.append(f"{TARGET_SHEETS_CANON.get(sk, present[sk])}: no matching tab found")
