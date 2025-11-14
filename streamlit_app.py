@@ -1,11 +1,16 @@
 # streamlit_app.py
-# Walmart Masterfile Filler — Unified Preview (Rows 2–4 only) + Horizontal Mapping
-# - Preview shows ONLY rows 2–4. Row 1 and Row 6 are never shown. Row 5 stays hidden if the sheet hides it.
-# - Preview is colorful (solid fills) with theme/tint/indexed color support; merged cells, fonts, and alignment approximated.
-# - Preview and the horizontal mapping row live in ONE unified section with ONE horizontal scroll.
-# - Mapping still uses your chosen header rows (default: 5), so hidden row 5 can remain your mapping header.
-# - Preserves .xlsm macros/validations/formatting; writes from row 7 by default (configurable).
-# - Auto-save mapping on sheet switch; import workbook (PCSE/TIC); duplicate highlighting.
+# Walmart Masterfile Filler — Unified Preview (Rows 2–5) + Horizontal Mapping
+# - Preview shows ONLY rows 2–5 (row 1 & 6 excluded).
+# - Columns that are blank across rows 2–5 are hidden (so A/B/C disappear if empty).
+# - Colorful preview: RGB / THEME(+tint) / INDEXED fills, merged cells, fonts, alignment, approx widths/heights.
+# - Mapping row directly beneath preview (single-section workflow). Row 5 visible in preview to aid mapping.
+# - Composite headers for mapping (e.g., 3,4,5), writes from row 7 by default (configurable).
+# - Preserves macros/formatting/validations; auto-save on sheet switch; import (PCSE/TIC); duplicate highlighting.
+#
+# Requirements:
+#   streamlit>=1.32
+#   pandas>=2.0
+#   openpyxl>=3.1
 
 import re
 from io import BytesIO
@@ -34,27 +39,24 @@ st.markdown(
 st.divider()
 
 # =============================
-# Canonical target sheets (normalized key -> display name)
+# Canonical target sheets
 # =============================
 TARGET_SHEETS_CANON = {
     "productcontentandsiteexp": "Product Content And Site Exp",
     "tradeitemconfigurations": "Trade Item Configurations",
 }
 CANON_ORDER = ["productcontentandsiteexp", "tradeitemconfigurations"]
-
-# Synonyms for mapping workbook tab detection (import)
 MAPPING_TAB_SYNONYMS = {
     "productcontentandsiteexp": ["product content and site exp", "product site exp", "pcse"],
     "tradeitemconfigurations": ["trade item configurations", "trade item", "tic"],
 }
 
 # Defaults
-DEFAULT_HEADER_ROWS = [5]   # header(s) used for mapping (row 5 can stay hidden visually)
+DEFAULT_HEADER_ROWS = [5]   # use 3,4,5 if your template builds headers from multiple rows
 DEFAULT_DATA_START_ROW = 7  # write from row 7 by default
 
-# Duplicate highlighting style in exported workbook
+# Duplicate highlight style in exported Excel
 YELLOW_DUP_FILL = PatternFill(start_color="FFFF00", end_color="FFFF00", fill_type="solid")
-
 
 # =============================
 # Helpers
@@ -86,7 +88,7 @@ def _enforce_extension(filename: str, is_xlsm: bool) -> str:
 def _find_target_sheets(actual_names: List[str]) -> Dict[str, str]:
     present: Dict[str, str] = {}
     norm_actual = { _norm_key(n): n for n in actual_names }
-    for canon_norm, _display in TARGET_SHEETS_CANON.items():
+    for canon_norm in TARGET_SHEETS_CANON.keys():
         if canon_norm in norm_actual:
             present[canon_norm] = norm_actual[canon_norm]
             continue
@@ -96,7 +98,7 @@ def _find_target_sheets(actual_names: List[str]) -> Dict[str, str]:
                 break
     return present
 
-# ---------- Excel reading ----------
+# ---------- Excel helpers ----------
 def _get_cell_value_with_merge(ws, row: int, col: int):
     cell = ws.cell(row=row, column=col)
     if cell.value not in (None, ""):
@@ -128,27 +130,27 @@ def _extract_headers_composite(ws, header_rows: List[int]) -> Tuple[List[str], D
             continue
         composite = " | ".join(parts)
         headers.append(composite)
-        pos = len(headers)
-        pos_to_col[pos] = col_idx
+        pos_to_col[len(headers)] = col_idx
         norm = _norm_key(composite)
         norm_to_cols.setdefault(norm, []).append(col_idx)
+
     return headers, pos_to_col, norm_to_cols
 
-# ---------- Color + size approximation ----------
+# ---------- Color & size conversion ----------
 THEME_COLOR_MAP = {
     0: "#FFFFFF", 1: "#000000", 2: "#EEECE1", 3: "#1F497D",
-    4: "#4F81BD", 5: "#C0504D", 6: "#9BBB59", 7: "#8064A2", 8: "#4BACC6", 9: "#F79646",
+    4: "#4F81BD", 5: "#C0504D", 6: "#9BBB59", 7: "#8064A2",
+    8: "#4BACC6", 9: "#F79646",
 }
-INDEXED_COLOR_FALLBACK = {64: "#FFFFFF", 9: "#000000"}  # 64=Automatic, 9=Black (common)
+INDEXED_COLOR_FALLBACK = {64: "#FFFFFF", 9: "#000000"}  # 64=Automatic, 9=Black
 
 def _apply_tint_to_hex(hex_color: str, tint: float) -> str:
     try:
         h = hex_color.lstrip("#")
         r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
         def adj(ch):
-            if tint < 0:  # darken
+            if tint < 0:
                 return int(ch * (1.0 + tint))
-            # lighten
             return int(ch + (255 - ch) * tint)
         r = min(255, max(0, adj(r)))
         g = min(255, max(0, adj(g)))
@@ -183,25 +185,38 @@ def _excel_col_width_to_pixels(width: Optional[float]) -> int:
     return max(32, int(round((float(width) + 0.72) * 7)))
 
 def _excel_row_height_to_pixels(height: Optional[float]) -> int:
-    # 1pt = 1/72in; 96dpi => px = pt * 96/72
+    # 1pt = 1/72in; 96 DPI -> px
     if height is None:
         height = 15.0
     return max(16, int(round(float(height) * 96.0 / 72.0)))
 
-# ---------- Styled preview (ROWS 2–4 only, row 5 hidden honored) ----------
-def _build_header_preview_html(ws, visible_rows: List[int]) -> Tuple[str, int, List[int]]:
+# ---------- Styled preview (ROWS 2–5), hiding columns that are blank across 2–5 ----------
+def _build_header_preview_html_rows(ws, rows_to_render: List[int]) -> Tuple[str, int, List[int], List[int]]:
     """
-    Build an HTML table for the given visible rows that respects:
-      - merged cells (rowspan/colspan)
-      - solid fills (background-color) with theme/tint/indexed support
-      - fonts (bold/italic/underline/color) and alignment
-      - column widths and row heights (approximated)
-    Returns: (html, table_height_px, col_widths_px_list)
+    Build a colorful HTML table for the given rows (e.g., [2,3,4,5]).
+    Hides any column that is blank across ALL of these rows (using merged-aware value lookup).
+    Returns (html, total_height_px, visible_col_widths_px, visible_col_indexes)
     """
-    # Filter out hidden rows
-    visible_rows = [r for r in visible_rows if not getattr(ws.row_dimensions.get(r, None), "hidden", False)]
+    rows_to_render = [r for r in rows_to_render if r >= 1]
+    if not rows_to_render:
+        return "<div>No rows to preview.</div>", 60, [], []
 
     max_col = ws.max_column or 0
+
+    # Determine which columns are visible: keep columns with any non-blank value in rows_to_render
+    visible_cols: List[int] = []
+    for c in range(1, max_col + 1):
+        any_val = False
+        for r in rows_to_render:
+            v = _get_cell_value_with_merge(ws, r, c)
+            if v is not None and str(v).strip() != "":
+                any_val = True
+                break
+        if any_val:
+            visible_cols.append(c)
+
+    if not visible_cols:
+        return "<div>No visible columns in rows 2–5.</div>", 60, [], []
 
     # Precompute merged ranges
     top_left_to_span = {}
@@ -210,20 +225,22 @@ def _build_header_preview_html(ws, visible_rows: List[int]) -> Tuple[str, int, L
         rowspan = rng.max_row - rng.min_row + 1
         colspan = rng.max_col - rng.min_col + 1
         top_left_to_span[(rng.min_row, rng.min_col)] = (rowspan, colspan)
-        for r in range(rng.min_row, rng.max_row + 1):
-            for c in range(rng.min_col, rng.max_col + 1):
-                if not (r == rng.min_row and c == rng.min_col):
-                    covered.add((r, c))
+        # Only mark covered cells in our requested rows & visible columns
+        for r in rows_to_render:
+            if rng.min_row <= r <= rng.max_row:
+                for c in range(rng.min_col, rng.max_col + 1):
+                    if c in visible_cols and not (r == rng.min_row and c == rng.min_col):
+                        covered.add((r, c))
 
-    # Column widths
-    col_widths_px = []
-    for c in range(1, max_col + 1):
+    # Column widths (for visible columns only)
+    col_widths_px: List[int] = []
+    for c in visible_cols:
         letter = get_column_letter(c)
-        dim = ws.column_dimensions.get(letter)
-        col_widths_px.append(_excel_col_width_to_pixels(getattr(dim, "width", None)))
+        w = ws.column_dimensions[letter].width
+        col_widths_px.append(_excel_col_width_to_pixels(w))
 
-    # Total height
-    total_height_px = sum(_excel_row_height_to_pixels(ws.row_dimensions[r].height) for r in visible_rows) + 12
+    # Total table height
+    total_height_px = sum(_excel_row_height_to_pixels(ws.row_dimensions[r].height) for r in rows_to_render) + 12
 
     # Build HTML
     parts = []
@@ -238,36 +255,36 @@ def _build_header_preview_html(ws, visible_rows: List[int]) -> Tuple[str, int, L
         parts.append(f'<col style="width:{px}px;">')
     parts.append("</colgroup><tbody>")
 
-    for r in visible_rows:
+    for r in rows_to_render:
         h_px = _excel_row_height_to_pixels(ws.row_dimensions[r].height)
         parts.append(f'<tr style="height:{h_px}px;">')
-        c = 1
-        while c <= max_col:
-            # Skip interior of merged ranges (not top-left)
+        for c in visible_cols:
             if (r, c) in covered and (r, c) not in top_left_to_span:
-                c += 1
                 continue
             cell = ws.cell(row=r, column=c)
 
-            # Span handling
+            # spans, clamped vertically to our rows; horizontally we keep colspan but render only visible columns
             rs, cs = 1, 1
             if (r, c) in top_left_to_span:
-                rs_all, cs = top_left_to_span[(r, c)]
-                # clamp rowspan to our visible rows (2–4)
-                visible_set = set(visible_rows)
-                rs = sum(1 for rr in range(r, r + rs_all) if rr in visible_set)
+                rs_all, cs_all = top_left_to_span[(r, c)]
+                # Vertical clamp
+                max_r = r
+                for rr in range(r, r + rs_all):
+                    if rr in rows_to_render:
+                        max_r = rr
+                rs = max(1, max_r - r + 1)
+                # Horizontal clamp: count how many columns in this merge exist in visible_cols from c onward
+                horiz_cols = [cc for cc in range(c, c + cs_all) if cc in visible_cols]
+                cs = max(1, len(horiz_cols))
 
-            # Background fill
+            # background
             bg = None
             fill = getattr(cell, "fill", None)
-            try:
-                if isinstance(fill, PatternFill) and getattr(fill, "fill_type", None) == "solid":
-                    color_obj = getattr(fill, "fgColor", None) or getattr(fill, "start_color", None)
-                    bg = _excel_color_to_hex(color_obj)
-            except Exception:
-                bg = None
+            if isinstance(fill, PatternFill) and getattr(fill, "fill_type", None) == "solid":
+                color_obj = getattr(fill, "fgColor", None) or getattr(fill, "start_color", None)
+                bg = _excel_color_to_hex(color_obj)
 
-            # Font & alignment
+            # font & alignment
             font = cell.font
             bold = "bold" if getattr(font, "bold", False) else "normal"
             italic = "italic" if getattr(font, "italic", False) else "normal"
@@ -297,19 +314,19 @@ def _build_header_preview_html(ws, visible_rows: List[int]) -> Tuple[str, int, L
             if fcolor: styles.append(f"color:{fcolor}")
             if bg: styles.append(f"background-color:{bg}")
 
-            value = _get_cell_value_with_merge(ws, r, c)
-            text = "" if value in (None, "") else str(value)
-            text = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            v = _get_cell_value_with_merge(ws, r, c)
+            txt = "" if v in (None, "") else str(v)
+            txt = txt.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
-            span = ""
-            if rs > 1: span += f' rowspan="{rs}"'
-            if cs > 1: span += f' colspan="{cs}"'
+            span_attrs = ""
+            if rs > 1: span_attrs += f' rowspan="{rs}"'
+            if cs > 1: span_attrs += f' colspan="{cs}"'
 
-            parts.append(f'<td{span} style="{";".join(styles)}">{text}</td>')
-            c += cs
+            parts.append(f'<td{span_attrs} style="{";".join(styles)}">{txt}</td>')
         parts.append("</tr>")
     parts.append("</tbody></table></div>")
-    return "".join(parts), total_height_px, col_widths_px
+
+    return "".join(parts), total_height_px, col_widths_px, visible_cols
 
 # ---------- Widget key helpers ----------
 def _map_key(sheet_key: str, templ_norm: str, pos: int) -> str:
@@ -455,7 +472,7 @@ def _export_mapping_df(present_sheets: Dict[str, str],
             rows.append({"Sheet": TARGET_SHEETS_CANON.get(sk, actual_name), "Position": pos, "Column": col_letter, "Template": t, "Raw": v})
     return pd.DataFrame(rows)
 
-# ---------- Duplicate RAW selection handling ----------
+# ---------- Duplicates handling ----------
 def _resolve_duplicate_raw_mappings(records: List[Dict[str, str]], auto_resolve: bool) -> Tuple[List[Dict[str, str]], List[str]]:
     bucket: Dict[str, List[Dict[str, str]]] = {}
     for r in records:
@@ -504,7 +521,7 @@ def _write_sheet_data(ws, mapping: List[Dict[str, str]],
             val = raw_df.iloc[i][raw_name] if raw_name in raw_df.columns else None
             ws.cell(row=excel_row, column=col_idx, value=val)
 
-    # Duplicate highlighting
+    # Highlight duplicates
     dup_norms = [_norm_key(x) for x in dup_headers_to_highlight if str(x).strip()]
     for want_norm in dup_norms:
         match_cols = set()
@@ -529,6 +546,7 @@ def _write_sheet_data(ws, mapping: List[Dict[str, str]],
                     continue
                 if str(v) in dup_values:
                     cell.fill = YELLOW_DUP_FILL
+
     return nrows, missing
 
 def _build_output_bytes(template_bytes: bytes,
@@ -567,10 +585,10 @@ def _build_output_bytes(template_bytes: bytes,
         )
 
     bio_out = BytesIO()
-    wb.save(bio_out)  # preserves formatting/validations/macros; we only wrote values below headers
+    wb.save(bio_out)  # preserves formatting/validations/macros
     return bio_out.getvalue()
 
-# ---------- Ordering helpers ----------
+# ---------- Ordering / matching ----------
 def _ordered_keys(present_sheets: Dict[str, str]) -> List[str]:
     ordered = [k for k in CANON_ORDER if k in present_sheets]
     ordered += [k for k in present_sheets.keys() if k not in ordered]
@@ -612,7 +630,7 @@ for k, v in [
     st.session_state.setdefault(k, v)
 
 # =============================
-# Preserve scroll position
+# Keep scroll position
 # =============================
 st.components.v1.html(
     """
@@ -634,7 +652,7 @@ st.components.v1.html(
 tab1, tab2, tab3 = st.tabs([
     "Upload Masterfile Template",
     "Upload Raw / Onboarding Data",
-    "Unified Preview (Rows 2–4) + Mapping",
+    "Unified Preview (Rows 2–5) + Mapping",
 ])
 
 # -----------------------------
@@ -649,7 +667,7 @@ with tab1:
         hdr_str = st.text_input(
             "Header rows to combine (comma‑separated, top→bottom)",
             value=hdr_str_default,
-            help="Example: 5  or  3,4,5. Row 5 may be hidden visually but still used for mapping headers."
+            help="Example: 5  or  3,4,5 — row 5 is often the anchor for field names."
         )
         st.session_state["header_rows"] = _parse_rows_input(hdr_str, DEFAULT_HEADER_ROWS)
     with c2:
@@ -657,7 +675,6 @@ with tab1:
         st.session_state["data_start_row"] = int(dsr)
 
     tpl = st.file_uploader("Upload template", type=["xlsx", "xlsm"], key="template_uploader")
-
     do_rescan = False
     if st.session_state.get("template_bytes"):
         do_rescan = st.button("Re‑scan headers using current rows")
@@ -670,10 +687,9 @@ with tab1:
         else:
             raw_bytes = st.session_state["template_bytes"]
 
-        is_xlsm = st.session_state["template_ext"] == "xlsm"
+        is_xlsm = (st.session_state["template_ext"] == "xlsm")
         wb = load_workbook(BytesIO(raw_bytes), read_only=False, keep_vba=is_xlsm, data_only=False)
-        all_names = wb.sheetnames
-        present = _find_target_sheets(all_names)
+        present = _find_target_sheets(wb.sheetnames)
 
         templ_headers_by_sheet: Dict[str, List[str]] = {}
         pos_to_col_by_sheet: Dict[str, Dict[int, int]] = {}
@@ -692,7 +708,7 @@ with tab1:
         st.session_state["pos_to_col_by_sheet"] = pos_to_col_by_sheet
         st.session_state["templ_header_sigs"] = templ_header_sigs
 
-        # Clear live & saved mapping only for sheets whose header signature changed
+        # Clear live/saved mapping only for sheets whose header signature changed
         for sk, sig in templ_header_sigs.items():
             if prev_sigs.get(sk) != sig:
                 p_map = f"map_{sk}_"
@@ -703,15 +719,15 @@ with tab1:
                 if sk in st.session_state["saved_mapping"]:
                     del st.session_state["saved_mapping"][sk]
 
-        ordered = _ordered_keys(present)
+        ordered = [k for k in CANON_ORDER if k in present] + [k for k in present if k not in CANON_ORDER]
         if ordered and st.session_state.get("current_sheet_key") not in present:
             st.session_state["current_sheet_key"] = ordered[0]
 
         st.success("Template loaded & headers scanned.")
         if present:
-            st.caption(f"Header rows for mapping: {', '.join(str(r) for r in st.session_state['header_rows'])}. Data will be written from row {st.session_state['data_start_row']}.")
+            st.caption(f"Mapping header rows: {', '.join(str(r) for r in st.session_state['header_rows'])}. Data writes from row {st.session_state['data_start_row']}.")
             st.write("Detected target sheets:")
-            for sk in _ordered_keys(present):
+            for sk in ordered:
                 st.write(f"- **{TARGET_SHEETS_CANON.get(sk, present[sk])}** (actual: `{present[sk]}`)")
         else:
             st.warning("No target sheets found. Expected PCSE and/or TIC.")
@@ -736,6 +752,7 @@ with tab2:
         new_headers = list(raw_df.columns)
         new_sig = "|".join(new_headers)
 
+        # Clear only selections that reference removed raw headers
         removed = set(st.session_state.get("raw_prev_headers", [])) - set(new_headers)
         if removed:
             for sk in st.session_state.get("present_sheets", {}).keys():
@@ -743,7 +760,9 @@ with tab2:
                     if k.startswith(f"map_{sk}_") and st.session_state.get(k, "") in removed:
                         st.session_state[k] = ""
                 if "saved_mapping" in st.session_state and sk in st.session_state["saved_mapping"]:
-                    st.session_state["saved_mapping"][sk] = [r for r in st.session_state["saved_mapping"][sk] if r.get("raw_header") not in removed]
+                    st.session_state["saved_mapping"][sk] = [
+                        r for r in st.session_state["saved_mapping"][sk] if r.get("raw_header") not in removed
+                    ]
 
         st.session_state["raw_prev_headers"] = new_headers
         st.session_state["raw_headers"] = new_headers
@@ -755,10 +774,10 @@ with tab2:
             st.dataframe(raw_df.head(20), use_container_width=True)
 
 # -----------------------------
-# Tab 3: Unified Preview (Rows 2–4) + Mapping
+# Tab 3: Unified Preview (Rows 2–5) + Mapping
 # -----------------------------
 with tab3:
-    st.markdown("#### Step 3 of 3 — Unified Preview (Rows 2–4) + Horizontal Mapping")
+    st.markdown("#### Step 3 of 3 — Unified Preview (Rows 2–5) + Horizontal Mapping")
 
     if not st.session_state.get("template_bytes"):
         st.info("Please upload a masterfile template in tab 1.")
@@ -782,33 +801,27 @@ with tab3:
     key_by_display = { TARGET_SHEETS_CANON.get(sk, present[sk]): sk for sk in ordered }
 
     current_key_before = st.session_state.get("current_sheet_key", ordered[0])
-    default_index = 0
-    if current_key_before in present:
-        dname = TARGET_SHEETS_CANON.get(current_key_before, present.get(current_key_before, ""))
-        if dname in display_names:
-            default_index = display_names.index(dname)
-
+    default_index = display_names.index(TARGET_SHEETS_CANON.get(current_key_before, present.get(current_key_before, ""))) if current_key_before in present else 0
     selected_display = st.radio("Choose target sheet", options=display_names, index=default_index, horizontal=True)
     sheet_key = key_by_display[selected_display]
 
+    # Auto-save on sheet change
     if current_key_before != sheet_key and current_key_before in present:
         _commit_current_sheet_mapping(current_key_before, templ_headers_by_sheet.get(current_key_before, []))
     st.session_state["current_sheet_key"] = sheet_key
 
-    # Load selected sheet for preview/mapping
+    # Preview rows 2–5 (hide columns that are blank across these rows)
     is_xlsm = (st.session_state.get("template_ext", "xlsx") == "xlsm")
-    wb = load_workbook(BytesIO(st.session_state["template_bytes"]), read_only=False, keep_vba=is_xlsm, data_only=False)
-    ws = wb[present[sheet_key]]
+    wb_prev = load_workbook(BytesIO(st.session_state["template_bytes"]), read_only=False, keep_vba=is_xlsm, data_only=False)
+    ws_prev = wb_prev[present[sheet_key]]
 
-    # Build preview for rows 2–4 (row 5 & 6 not shown; row 5 stays hidden if the sheet hides it)
-    preview_rows = [2, 3, 4]
-    html_preview, exact_height, col_widths_px = _build_header_preview_html(ws, visible_rows=preview_rows)
+    preview_rows = [2, 3, 4, 5]
+    st.markdown("**Template preview (rows 2–5; blank columns hidden)**")
+    html_preview, exact_height, preview_col_widths, visible_cols = _build_header_preview_html_rows(ws_prev, preview_rows)
+    st.components.v1.html(html_preview, height=exact_height + 12, scrolling=False)
 
-    # Display preview (no inner scrollbar) — page provides single horizontal scroll
-    st.components.v1.html(html_preview, height=exact_height + 16, scrolling=False)
-
-    # Prepare mapping headers & alignment
-    headers_for_map, pos_to_col, _ = _extract_headers_composite(ws, st.session_state["header_rows"])
+    # Build mapping headers (from the configured header_rows)
+    headers_for_map, pos_to_col, _ = _extract_headers_composite(ws_prev, st.session_state["header_rows"])
     templ_headers_by_sheet[sheet_key] = headers_for_map
     pos_to_col_by_sheet[sheet_key] = pos_to_col
     st.session_state["templ_headers_by_sheet"] = templ_headers_by_sheet
@@ -817,21 +830,7 @@ with tab3:
     templ_headers = templ_headers_by_sheet.get(sheet_key, [])
     _hydrate_live_from_saved(sheet_key, templ_headers)
 
-    # CSS tweaks to make Data Editor expand to max-content width (single scroll with preview)
-    st.markdown(
-        """
-        <style>
-        /* Flatten Data Editor's horizontal scroll so the page provides ONE scrollbar */
-        div[data-testid="stDataFrame"] { overflow: visible !important; }
-        div[data-testid="stDataFrame"] > div { width: max-content !important; }
-        /* Give the editor a subtle border to visually connect with the preview */
-        div[data-testid="stDataFrame"] { border: 1px solid #ddd; border-radius: 6px; }
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
-
-    # Horizontal mapping row (one select per template column), aligned by Excel column widths
+    # Mapping row
     st.markdown("**Mapping row (choose a raw column for each template column)**")
     if not raw_headers:
         st.warning("Upload raw data first to enable mapping.")
@@ -839,30 +838,36 @@ with tab3:
         options = [""] + raw_headers
         initial = {}
         col_config = {}
+        # match each template header's width to its real Excel column width (if visible)
+        # if its Excel column was hidden from preview (all-blank), we still size using the workbook width
         for t, templ_norm, pos, mkey, _ in _iter_template_positions(sheet_key, templ_headers):
             col_idx = pos_to_col.get(pos, 0)
             col_letter = get_column_letter(col_idx) if col_idx else ""
             label = f"{col_letter} {t}".strip()
             initial[label] = st.session_state.get(mkey, "")
-            width_px = col_widths_px[col_idx - 1] if col_idx and (col_idx - 1) < len(col_widths_px) else 120
+            # choose width: use preview_col_widths mapping if column is in visible_cols; else compute from workbook
+            if col_idx in visible_cols:
+                width_px = preview_col_widths[visible_cols.index(col_idx)]
+            else:
+                # fallback width for columns not visible in preview (should be rare after hiding blanks)
+                width_px = _excel_col_width_to_pixels(ws_prev.column_dimensions[get_column_letter(col_idx)].width if col_idx else 12.0)
             col_config[label] = st.column_config.SelectboxColumn(
                 label=label,
                 options=options,
                 required=False,
-                width=width_px,  # align visually under the preview's column widths
+                width=width_px,
             )
-
         seed_df = pd.DataFrame([initial]) if initial else pd.DataFrame([{}])
+
         edited_df = st.data_editor(
             seed_df,
             column_config=col_config,
             hide_index=True,
-            use_container_width=False,  # let width be dictated by per-column px widths
+            use_container_width=False,  # respect our per-column pixel widths
             num_rows="fixed",
             key=f"map_editor_{sheet_key}",
         )
 
-        # Push edits back into session state
         if isinstance(edited_df, pd.DataFrame) and len(edited_df) >= 1 and len(templ_headers) > 0:
             row0 = edited_df.iloc[0].to_dict()
             label_to_pos = {}
@@ -881,7 +886,7 @@ with tab3:
                             _touch_tick(sheet_key, templ_norm, pos)
 
     st.markdown("---")
-    c1, c2, c3 = st.columns((1, 1, 1))
+    c1, c2 = st.columns((1, 1))
     with c1:
         if st.button("Auto‑map (exact)", use_container_width=True):
             _auto_map_exact(sheet_key, templ_headers, raw_headers)
@@ -891,8 +896,6 @@ with tab3:
         if st.button("Auto‑map (fuzzy)", use_container_width=True):
             _auto_map_fuzzy(sheet_key, templ_headers, raw_headers, threshold=fuzz_thr)
             st.toast(f"Fuzzy auto‑map applied at threshold {fuzz_thr} (blanks only).")
-    with c3:
-        st.caption(" ")
 
     st.markdown("---")
     st.markdown("**Import mapping workbook (.xlsx with two tabs: PCSE & TIC)**")
@@ -923,14 +926,6 @@ with tab3:
         mime="text/csv",
         use_container_width=True,
     )
-    export_df_sel = _export_mapping_df(present, templ_headers_by_sheet, pos_to_col_by_sheet, only_sheet_key=sheet_key)
-    st.download_button(
-        "Export mapping (selected sheet)",
-        data=export_df_sel.to_csv(index=False).encode("utf-8"),
-        file_name=f"mapping_export_{TARGET_SHEETS_CANON.get(sheet_key, sheet_key)}.csv",
-        mime="text/csv",
-        use_container_width=True,
-    )
 
     st.markdown("---")
     auto_resolve = st.checkbox(
@@ -948,7 +943,7 @@ with tab3:
     file_name_input = st.text_input("Output filename", value=suggested_name)
     final_name = _enforce_extension(file_name_input, is_xlsm=is_xlsm)
 
-    b1, b2, b3 = st.columns((1, 1, 1))
+    b1, b2 = st.columns((1, 1))
     with b1:
         if st.button("Save mapping (selected sheet)", use_container_width=True):
             _commit_current_sheet_mapping(sheet_key, templ_headers)
@@ -967,26 +962,6 @@ with tab3:
                     auto_resolve_dupe_mappings=auto_resolve,
                     dup_columns_to_highlight=dup_cols,
                     saved_mapping_store=st.session_state.get("saved_mapping", {}),
-                )
-                st.session_state["download_payload"] = payload
-                st.success("File prepared. Use the download button below.")
-            except ValueError as ve:
-                st.error(str(ve))
-            except Exception as e:
-                st.error(f"Failed to build file: {e}")
-    with b3:
-        if st.button("Build (selected sheet only)", use_container_width=True):
-            try:
-                payload = _build_output_bytes(
-                    template_bytes=st.session_state["template_bytes"],
-                    template_is_xlsm=is_xlsm,
-                    sheets_to_process={sheet_key: present[sheet_key]},
-                    templ_headers_by_sheet=templ_headers_by_sheet,
-                    header_rows=st.session_state.get("header_rows", DEFAULT_HEADER_ROWS),
-                    raw_df=raw_df,
-                    auto_resolve_dupe_mappings=auto_resolve,
-                    dup_columns_to_highlight=dup_cols,
-                    saved_mapping_store=None,
                 )
                 st.session_state["download_payload"] = payload
                 st.success("File prepared. Use the download button below.")
