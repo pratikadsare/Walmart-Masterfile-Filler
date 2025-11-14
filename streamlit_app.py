@@ -1,19 +1,12 @@
 # streamlit_app.py
-# Walmart Masterfile Filler — Horizontal Mapping with Styled Excel Preview (rows 1–6)
-# - Shows a near-pixel preview of the first 6 rows *with* merged cells, fills, fonts, alignments, widths/heights (approx)
-# - Horizontal mapping row (one select per template column) sits directly beneath the preview
-# - Supports multi-row/composite headers (e.g., 3,4,5) for mapping
-# - Preserves template macros/formatting/validations in the exported Excel
-# - Writes starting from row 7 by default (configurable)
-# - Duplicate highlighting defaults to: SKU, productId, manufacturerPartNumber
-#
-# Requirements:
-#   streamlit>=1.32
-#   pandas>=2.0
-#   openpyxl>=3.1
+# Walmart Masterfile Filler — Horizontal Mapping with High‑Fidelity Header Preview (Rows 2–6, no inner scroll)
+# - Styled preview shows rows 2–6 "as-is" (merged cells, fills, fonts/alignment approximated) without its own scrollbar
+# - Horizontal mapping row (one dropdown per template column) directly beneath the preview in the same section
+# - Supports composite (multi-row) headers for mapping
+# - Preserves macros/formatting/validations on export; writes from row 7 (configurable)
+# - Auto-save mapping on sheet switch, fuzzy/exact automap, one workbook importer (PCSE/TIC), duplicate highlighting
 
 import re
-import html
 from io import BytesIO
 from difflib import SequenceMatcher
 from typing import Dict, List, Tuple, Optional
@@ -24,7 +17,6 @@ from openpyxl import load_workbook
 from openpyxl.styles import PatternFill
 from openpyxl.utils import get_column_letter
 
-
 # =============================
 # Page config & hero
 # =============================
@@ -32,14 +24,13 @@ st.set_page_config(page_title="Walmart Masterfile Filler", layout="wide")
 st.markdown(
     """
     <div style="text-align:center; margin-top:-0.5rem; margin-bottom:0.5rem;">
-      <h1 style="margin-bottom:0.25rem;">Walmart Masterfile Filler 2</h1>
+      <h1 style="margin-bottom:0.25rem;">Walmart Masterfile Filler</h1>
       <p style="margin-top:0; font-size:1.05rem;">Empowering Innovation ⏐ Maximizing Performance</p>
     </div>
     """,
     unsafe_allow_html=True,
 )
 st.divider()
-
 
 # =============================
 # Canonical target sheets (normalized key -> display name)
@@ -57,22 +48,20 @@ MAPPING_TAB_SYNONYMS = {
 }
 
 # Defaults
-DEFAULT_HEADER_ROWS = [5]   # can be customized (e.g., 3,4,5)
+DEFAULT_HEADER_ROWS = [5]   # you can change in UI (e.g., 3,4,5 for composite headers)
 DEFAULT_DATA_START_ROW = 7  # write from row 7 by default
 
-# Highlight style for duplicate cells in the exported Excel
+# Highlight style for duplicate cells (in exported Excel)
 YELLOW_DUP_FILL = PatternFill(start_color="FFFF00", end_color="FFFF00", fill_type="solid")
 
-
 # =============================
-# Helpers
+# Utilities
 # =============================
 def _norm_key(s: str) -> str:
     if s is None:
         return ""
     s = str(s).strip().lower().replace("&", "and")
     return re.sub(r"[^a-z0-9]+", "", s)
-
 
 def _parse_rows_input(s: str, default: List[int]) -> List[int]:
     try:
@@ -81,7 +70,6 @@ def _parse_rows_input(s: str, default: List[int]) -> List[int]:
         return vals if vals else default
     except Exception:
         return default
-
 
 def _enforce_extension(filename: str, is_xlsm: bool) -> str:
     if not filename:
@@ -93,10 +81,9 @@ def _enforce_extension(filename: str, is_xlsm: bool) -> str:
         filename = re.sub(r"\.(xlsm|xls)$", "", filename, flags=re.IGNORECASE) + ".xlsx"
     return filename
 
-
 def _find_target_sheets(actual_names: List[str]) -> Dict[str, str]:
     present: Dict[str, str] = {}
-    norm_actual = {_norm_key(n): n for n in actual_names}
+    norm_actual = { _norm_key(n): n for n in actual_names }
     for canon_norm, _display in TARGET_SHEETS_CANON.items():
         if canon_norm in norm_actual:
             present[canon_norm] = norm_actual[canon_norm]
@@ -107,20 +94,23 @@ def _find_target_sheets(actual_names: List[str]) -> Dict[str, str]:
                 break
     return present
 
-
+# ---------- Excel reading helpers ----------
 def _get_cell_value_with_merge(ws, row: int, col: int):
     cell = ws.cell(row=row, column=col)
     if cell.value not in (None, ""):
         return cell.value
-    # If cell is part of a merged range, return top-left value
     for rng in ws.merged_cells.ranges:
         if rng.min_row <= row <= rng.max_row and rng.min_col <= col <= rng.max_col:
             return ws.cell(row=rng.min_row, column=rng.min_col).value
     return None
 
-
 def _extract_headers_composite(ws, header_rows: List[int]) -> Tuple[List[str], Dict[int, int], Dict[str, List[int]]]:
-    """Return (composite headers list, pos->col map, normalized header -> [col]) built from header_rows (multi-row headers)."""
+    """
+    Build composite headers by combining texts in multiple header rows for each column.
+      - headers: ordered list of composite header strings (for columns with any header text)
+      - pos_to_col: mapping 1-based header position -> column index
+      - norm_to_cols: mapping normalized composite header -> list of actual column indexes
+    """
     headers: List[str] = []
     pos_to_col: Dict[int, int] = {}
     norm_to_cols: Dict[str, List[int]] = {}
@@ -136,218 +126,198 @@ def _extract_headers_composite(ws, header_rows: List[int]) -> Tuple[List[str], D
             continue
         composite = " | ".join(parts)
         headers.append(composite)
-        pos = len(headers)  # 1-based position among "valid" columns
+        pos = len(headers)
         pos_to_col[pos] = col_idx
         norm = _norm_key(composite)
         norm_to_cols.setdefault(norm, []).append(col_idx)
 
     return headers, pos_to_col, norm_to_cols
 
+# ---------- Color & size approximation for HTML preview ----------
+THEME_COLOR_MAP = {
+    0: "#FFFFFF", 1: "#000000", 2: "#EEECE1", 3: "#1F497D",
+    4: "#4F81BD", 5: "#C0504D", 6: "#9BBB59", 7: "#8064A2", 8: "#4BACC6", 9: "#F79646",
+}
+INDEXED_COLOR_FALLBACK = {64: "#FFFFFF", 9: "#000000"}
 
-# ---------- Styled Excel preview (rows 1–6) as HTML ----------
-def _color_to_hex(color_obj) -> Optional[str]:
-    """
-    Convert openpyxl Color to CSS hex (#RRGGBB).
-    Handles rgb (ARGB) primarily; theme/indexed are returned as None (best-effort fallback).
-    """
-    if color_obj is None:
+def _apply_tint_to_hex(hex_color: str, tint: float) -> str:
+    try:
+        h = hex_color.lstrip("#")
+        r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+        def adj(ch):
+            if tint < 0:
+                return int(ch * (1.0 + tint))
+            return int(ch + (255 - ch) * tint)
+        r = min(255, max(0, adj(r)))
+        g = min(255, max(0, adj(g)))
+        b = min(255, max(0, adj(b)))
+        return f"#{r:02X}{g:02X}{b:02X}"
+    except Exception:
+        return hex_color
+
+def _excel_color_to_hex(color) -> Optional[str]:
+    if color is None:
         return None
     try:
-        if getattr(color_obj, "type", None) == "rgb" and color_obj.rgb:
-            rgb = color_obj.rgb
-            if isinstance(rgb, str) and len(rgb) == 8:  # ARGB
-                return f"#{rgb[-6:]}"
-            if isinstance(rgb, str) and len(rgb) == 6:
-                return f"#{rgb}"
-        # theme/indexed fallback: None (we'll leave default styling)
-        return None
+        typ = getattr(color, "type", None)
+        if typ == "rgb" and getattr(color, "rgb", None):
+            return "#" + color.rgb[-6:]
+        if typ == "theme" and getattr(color, "theme", None) is not None:
+            base = THEME_COLOR_MAP.get(color.theme)
+            tint = getattr(color, "tint", 0.0) or 0.0
+            if base:
+                return _apply_tint_to_hex(base, float(tint))
+            return base
+        if typ == "indexed" and getattr(color, "indexed", None) is not None:
+            return INDEXED_COLOR_FALLBACK.get(color.indexed)
     except Exception:
         return None
+    return None
 
-
-def _pt_to_px(points: float) -> int:
+def _excel_col_width_to_pixels(width: Optional[float]) -> int:
+    if width is None:
+        width = 8.43
     try:
-        return int(round(points * 96.0 / 72.0))  # 1pt = 1/72 in; 96 DPI
-    except Exception:
-        return 0
-
-
-def _col_width_to_px(width_chars: Optional[float]) -> int:
-    # Excel width ~ number of '0' characters; common rough conversion:
-    # px ≈ trunc(7 * width + 5)
-    if width_chars is None:
-        return 0
-    try:
-        return int(max(32, round(7 * float(width_chars) + 5)))
+        return max(32, int(round((width + 0.72) * 7)))
     except Exception:
         return 64
 
+def _excel_row_height_to_pixels(height: Optional[float]) -> int:
+    if height is None:
+        height = 15.0
+    try:
+        return max(16, int(round(height * 96.0 / 72.0)))
+    except Exception:
+        return 18
 
-def _build_preview_html(ws, max_rows: int = 6) -> str:
-    """
-    Build an HTML table for the first `max_rows` rows that respects:
-      - merged cells (rowspan/colspan)
-      - solid fills (background-color)
-      - font bold/italic/size/color
-      - horizontal/vertical alignment
-      - approximate column widths and row heights
-    """
-    # Precompute merged ranges for quick checks
-    merged_top_left = {}  # (r, c) -> merged range object
-    merged_cells = set()  # (r, c) coordinates that are within a merge
+def _build_header_preview_html(ws, start_row: int = 2, num_rows: int = 5, max_cols: Optional[int] = None) -> Tuple[str, int]:
+    """Return (html, exact_pixel_height) for rows start_row..start_row+num_rows-1."""
+    max_col = ws.max_column or 0
+    if max_cols is not None:
+        max_col = min(max_col, max_cols)
+
+    # Precompute merged ranges
+    top_left_to_span = {}
+    covered = set()
     for rng in ws.merged_cells.ranges:
+        rowspan = rng.max_row - rng.min_row + 1
+        colspan = rng.max_col - rng.min_col + 1
+        top_left_to_span[(rng.min_row, rng.min_col)] = (rowspan, colspan)
         for r in range(rng.min_row, rng.max_row + 1):
             for c in range(rng.min_col, rng.max_col + 1):
-                merged_cells.add((r, c))
-        merged_top_left[(rng.min_row, rng.min_col)] = rng
-
-    max_col = ws.max_column or 0
+                if not (r == rng.min_row and c == rng.min_col):
+                    covered.add((r, c))
 
     # Column widths
     col_widths_px = []
     for c in range(1, max_col + 1):
         letter = get_column_letter(c)
-        dim = ws.column_dimensions.get(letter)
-        w = _col_width_to_px(getattr(dim, "width", None))
-        col_widths_px.append(w if w > 0 else 80)
+        w = ws.column_dimensions[letter].width
+        col_widths_px.append(_excel_col_width_to_pixels(w))
 
-    # Row heights (first max_rows)
-    row_heights_px = []
-    for r in range(1, max_rows + 1):
-        dim = ws.row_dimensions.get(r)
-        if dim is not None and getattr(dim, "height", None):
-            row_heights_px.append(_pt_to_px(dim.height))
-        else:
-            row_heights_px.append(22)  # a reasonable default
+    # Total height
+    rows = range(start_row, start_row + num_rows)
+    total_height_px = sum(_excel_row_height_to_pixels(ws.row_dimensions[r].height) for r in rows) + 12  # padding
 
-    # Build table header (colgroup for widths)
+    # Build HTML table
     html_parts = []
     html_parts.append(
         """
-        <div style="overflow-x:auto;border:1px solid #e5e7eb;border-radius:6px;">
-          <table style="border-collapse:collapse; font-family:system-ui, -apple-system, Segoe UI, Roboto, Arial; font-size:13px; width:max-content;">
-            <colgroup>
+        <div style="max-width:100%; overflow-x:auto; border:1px solid #ddd; border-radius:6px; background:#fff;">
+        <table style="border-collapse:collapse; font-family:Arial, Helvetica, sans-serif; font-size:12px; width:max-content;">
+        <colgroup>
         """
     )
-    for w in col_widths_px:
-        html_parts.append(f'<col style="width:{w}px;">')
-    html_parts.append("</colgroup>")
+    for px in col_widths_px:
+        html_parts.append(f'<col style="width:{px}px;">')
+    html_parts.append("</colgroup><tbody>")
 
-    # Build rows 1..max_rows
-    for r in range(1, max_rows + 1):
-        tr_style = f"height:{row_heights_px[r-1]}px;"
-        html_parts.append(f'<tr style="{tr_style}">')
-
-        c = 1
-        while c <= max_col:
-            # Skip cells that are interior of a merge (not top-left)
-            if (r, c) in merged_cells and (r, c) not in merged_top_left:
-                c += 1
+    for r in rows:
+        h_px = _excel_row_height_to_pixels(ws.row_dimensions[r].height)
+        html_parts.append(f'<tr style="height:{h_px}px;">')
+        for c in range(1, max_col + 1):
+            if (r, c) in covered:
                 continue
-
             cell = ws.cell(row=r, column=c)
 
-            # Determine rowspan/colspan
-            rowspan = 1
-            colspan = 1
-            if (r, c) in merged_top_left:
-                rng = merged_top_left[(r, c)]
-                # clamp to preview window vertically
-                rng_max_row = min(rng.max_row, max_rows)
-                rowspan = max(1, rng_max_row - r + 1)
-                colspan = max(1, rng.max_col - c + 1)
+            # Span if merged top-left
+            rs, cs = 1, 1
+            if (r, c) in top_left_to_span:
+                rs_all, cs = top_left_to_span[(r, c)]
+                # clamp rowspan to our preview window
+                rs = max(1, min(rs_all, start_row + num_rows - r))
 
-            # Cell styles
-            styles = []
-            # Fill
+            # Background
+            bg = None
+            fill = getattr(cell, "fill", None)
+            if isinstance(fill, PatternFill) and getattr(fill, "fill_type", None) == "solid":
+                color_obj = getattr(fill, "fgColor", None) or getattr(fill, "start_color", None)
+                bg = _excel_color_to_hex(color_obj)
+
+            # Font & alignment
+            font = cell.font
+            bold = "bold" if getattr(font, "bold", False) else "normal"
+            italic = "italic" if getattr(font, "italic", False) else "normal"
+            underline = getattr(font, "underline", None)
+            txt_dec = "underline" if underline and underline != "none" else "none"
+            fcolor = None
             try:
-                fill = cell.fill
-                if isinstance(fill, PatternFill) and fill.fill_type == "solid":
-                    bg = _color_to_hex(fill.fgColor) or _color_to_hex(fill.start_color)
-                    if bg:
-                        styles.append(f"background-color:{bg};")
+                fcolor = _excel_color_to_hex(font.color) if font.color is not None else None
             except Exception:
-                pass
+                fcolor = None
 
-            # Font
-            try:
-                font = cell.font
-                if font is not None:
-                    if font.bold:
-                        styles.append("font-weight:600;")
-                    if font.italic:
-                        styles.append("font-style:italic;")
-                    if font.sz:
-                        styles.append(f"font-size:{_pt_to_px(float(font.sz))}px;")
-                    if font.color:
-                        fg = _color_to_hex(font.color)
-                        if fg:
-                            styles.append(f"color:{fg};")
-            except Exception:
-                pass
+            al = cell.alignment
+            hal = getattr(al, "horizontal", None) or "left"
+            val = getattr(al, "vertical", None) or "center"
+            wrap = getattr(al, "wrap_text", False)
 
-            # Alignment
-            try:
-                align = cell.alignment
-                if align is not None:
-                    if align.horizontal:
-                        styles.append(f"text-align:{align.horizontal};")
-                    if align.vertical:
-                        styles.append(f"vertical-align:{align.vertical};")
-            except Exception:
-                pass
+            styles = [
+                "border:1px solid #e0e0e0",
+                f"text-align:{hal}",
+                f"vertical-align:{'middle' if val=='center' else val}",
+                f"font-weight:{bold}",
+                f"font-style:{italic}",
+                f"text-decoration:{txt_dec}",
+                "padding:4px 6px",
+                f"white-space:{'normal' if wrap else 'nowrap'}",
+            ]
+            if fcolor:
+                styles.append(f"color:{fcolor}")
+            if bg:
+                styles.append(f"background-color:{bg}")
 
-            # Borders (simple hairline)
-            styles.append("border:1px solid #d1d5db; padding:2px 6px;")
+            value = _get_cell_value_with_merge(ws, r, c)
+            text = "" if value in (None, "") else str(value)
+            text = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
-            # Text value
-            val = _get_cell_value_with_merge(ws, r, c)
-            text = "" if val is None else html.escape(str(val))
+            span_attrs = ""
+            if rs > 1:
+                span_attrs += f' rowspan="{rs}"'
+            if cs > 1:
+                span_attrs += f' colspan="{cs}"'
 
-            # Emit TD
-            span = ""
-            if rowspan > 1:
-                span += f' rowspan="{rowspan}"'
-            if colspan > 1:
-                span += f' colspan="{colspan}"'
-            html_parts.append(f'<td{span} style="{"".join(styles)}">{text}</td>')
-
-            c += colspan
-
+            html_parts.append(f'<td{span_attrs} style="{";".join(styles)}">{text}</td>')
         html_parts.append("</tr>")
+    html_parts.append("</tbody></table></div>")
+    return "".join(html_parts), total_height_px
 
-    html_parts.append("</table></div>")
-    return "".join(html_parts)
-
-
-# ----- widget keys per position (prevents duplicate-key errors) -----
+# ---------- Widget key helpers ----------
 def _map_key(sheet_key: str, templ_norm: str, pos: int) -> str:
     return f"map_{sheet_key}_{pos}_{templ_norm}"
 
-
 def _tick_key(sheet_key: str, templ_norm: str, pos: int) -> str:
     return f"tick_{sheet_key}_{pos}_{templ_norm}"
-
 
 def _iter_template_positions(sheet_key: str, templ_headers: List[str]):
     for idx, t in enumerate(templ_headers, start=1):
         templ_norm = _norm_key(t)
         yield t, templ_norm, idx, _map_key(sheet_key, templ_norm, idx), _tick_key(sheet_key, templ_norm, idx)
 
-
 def _touch_tick(sheet_key: str, templ_norm: str, pos: int):
     st.session_state["last_edit_tick"] = st.session_state.get("last_edit_tick", 0) + 1
     st.session_state[_tick_key(sheet_key, templ_norm, pos)] = st.session_state["last_edit_tick"]
 
-
-def _make_on_change(sheet_key: str, templ_norm: str, pos: int):
-    def _cb():
-        _touch_tick(sheet_key, templ_norm, pos)
-    return _cb
-
-
 def _build_live_mapping_for_sheet(sheet_key: str, templ_headers: List[str]) -> List[Dict[str, str]]:
-    """Capture current selections as mapping records (skip blanks)."""
     records = []
     for t, templ_norm, pos, mkey, tkey in _iter_template_positions(sheet_key, templ_headers):
         raw = st.session_state.get(mkey, "") or ""
@@ -361,38 +331,32 @@ def _build_live_mapping_for_sheet(sheet_key: str, templ_headers: List[str]) -> L
             })
     return records
 
-
 def _commit_current_sheet_mapping(sheet_key: str, templ_headers: List[str]):
-    recs = _build_live_mapping_for_sheet(sheet_key, templ_headers)
-    saved = st.session_state.setdefault("saved_mapping", {})
-    saved[sheet_key] = recs
-    st.session_state["saved_mapping"] = saved
-
+    st.session_state.setdefault("saved_mapping", {})
+    st.session_state["saved_mapping"][sheet_key] = _build_live_mapping_for_sheet(sheet_key, templ_headers)
 
 def _hydrate_live_from_saved(sheet_key: str, templ_headers: List[str]):
     saved = st.session_state.get("saved_mapping", {})
     recs = saved.get(sheet_key, [])
-    by_pos = {r.get("templ_pos"): r.get("raw_header") for r in recs if r.get("templ_pos") is not None}
+    by_pos = { r.get("templ_pos"): r.get("raw_header") for r in recs if r.get("templ_pos") is not None }
     for t, templ_norm, pos, mkey, _ in _iter_template_positions(sheet_key, templ_headers):
         if not st.session_state.get(mkey, "") and pos in by_pos:
             st.session_state[mkey] = by_pos[pos]
 
-
-# ----- automap -----
+# ---------- Automap ----------
 def _auto_map_exact(sheet_key: str, templ_headers: List[str], raw_headers: List[str]):
-    norm_idx = {_norm_key(r): r for r in raw_headers}
+    norm_idx = { _norm_key(r): r for r in raw_headers }
     for t, templ_norm, pos, mkey, _ in _iter_template_positions(sheet_key, templ_headers):
-        if not st.session_state.get(mkey, ""):
-            # try exact composite match; else try last token
-            match = norm_idx.get(templ_norm)
-            if not match:
-                tokens = [tok.strip() for tok in t.split("|") if tok.strip()]
-                if tokens:
-                    match = norm_idx.get(_norm_key(tokens[-1]))
-            if match:
-                st.session_state[mkey] = match
-                _touch_tick(sheet_key, templ_norm, pos)
-
+        if st.session_state.get(mkey, ""):
+            continue
+        match = norm_idx.get(templ_norm)
+        if not match:
+            tokens = [tok.strip() for tok in t.split("|") if tok.strip()]
+            if tokens:
+                match = norm_idx.get(_norm_key(tokens[-1]))
+        if match:
+            st.session_state[mkey] = match
+            _touch_tick(sheet_key, templ_norm, pos)
 
 def _auto_map_fuzzy(sheet_key: str, templ_headers: List[str], raw_headers: List[str], threshold: int = 80):
     thr = max(0, min(100, threshold)) / 100.0
@@ -401,12 +365,10 @@ def _auto_map_fuzzy(sheet_key: str, templ_headers: List[str], raw_headers: List[
         if st.session_state.get(mkey, ""):
             continue
         best_raw, best_score = None, 0.0
-        # try composite
         for r, rnorm in raw_norms:
             score = SequenceMatcher(None, templ_norm, rnorm).ratio()
             if score > best_score:
                 best_score, best_raw = score, r
-        # try last token if composite insufficient
         if (best_raw is None) or (best_score < thr):
             tokens = [tok.strip() for tok in t.split("|") if tok.strip()]
             if tokens:
@@ -419,8 +381,7 @@ def _auto_map_fuzzy(sheet_key: str, templ_headers: List[str], raw_headers: List[
             st.session_state[mkey] = best_raw
             _touch_tick(sheet_key, templ_norm, pos)
 
-
-# ----- import/export mapping -----
+# ---------- Import/Export ----------
 def _header_match(import_templ: str, display_header: str) -> bool:
     a = _norm_key(import_templ)
     b = _norm_key(display_header)
@@ -432,16 +393,16 @@ def _header_match(import_templ: str, display_header: str) -> bool:
             return True
     return False
 
-
 def _import_mapping_df_for_sheet(df: pd.DataFrame,
                                  target_sheet_key: str,
                                  templ_headers_by_sheet: Dict[str, List[str]],
                                  raw_headers: List[str]) -> int:
-    cols = {_norm_key(c): c for c in df.columns}
-    tcol = next((cols[c] for c in ["template", "templateheader", "templ", "target", "targetheader"] if c in cols), None)
-    rcol = next((cols[c] for c in ["raw", "rawheader", "source", "sourceheader"] if c in cols), None)
+    cols = { _norm_key(c): c for c in df.columns }
+    tcol = next((cols[c] for c in ["template","templateheader","templ","target","targetheader"] if c in cols), None)
+    rcol = next((cols[c] for c in ["raw","rawheader","source","sourceheader"] if c in cols), None)
     if not tcol or not rcol:
         return 0
+
     templ_headers = templ_headers_by_sheet.get(target_sheet_key, [])
     raw_set = set(raw_headers)
     applied = 0
@@ -468,7 +429,6 @@ def _import_mapping_df_for_sheet(df: pd.DataFrame,
                 break
     return applied
 
-
 def _export_mapping_df(present_sheets: Dict[str, str],
                        templ_headers_by_sheet: Dict[str, List[str]],
                        pos_to_col_by_sheet: Dict[str, Dict[int, int]],
@@ -483,17 +443,10 @@ def _export_mapping_df(present_sheets: Dict[str, str],
         for t, templ_norm, pos, mkey, _ in _iter_template_positions(sk, templ_headers):
             v = st.session_state.get(mkey, "")
             col_letter = get_column_letter(pos_to_col.get(pos, 0)) if pos_to_col.get(pos, 0) else ""
-            rows.append({
-                "Sheet": TARGET_SHEETS_CANON.get(sk, actual_name),
-                "Position": pos,
-                "Column": col_letter,
-                "Template": t,
-                "Raw": v
-            })
+            rows.append({"Sheet": TARGET_SHEETS_CANON.get(sk, actual_name), "Position": pos, "Column": col_letter, "Template": t, "Raw": v})
     return pd.DataFrame(rows)
 
-
-# ----- duplicate RAW selection handling -----
+# ---------- Duplicate RAW selection handling ----------
 def _resolve_duplicate_raw_mappings(records: List[Dict[str, str]], auto_resolve: bool) -> Tuple[List[Dict[str, str]], List[str]]:
     bucket: Dict[str, List[Dict[str, str]]] = {}
     for r in records:
@@ -513,8 +466,7 @@ def _resolve_duplicate_raw_mappings(records: List[Dict[str, str]], auto_resolve:
     else:
         return records, dups
 
-
-# ----- writing -----
+# ---------- Writing ----------
 def _write_sheet_data(ws, mapping: List[Dict[str, str]],
                       header_rows: List[int],
                       start_row: int,
@@ -543,7 +495,7 @@ def _write_sheet_data(ws, mapping: List[Dict[str, str]],
             val = raw_df.iloc[i][raw_name] if raw_name in raw_df.columns else None
             ws.cell(row=excel_row, column=col_idx, value=val)
 
-    # Duplicate highlighting
+    # Highlight duplicates in the chosen columns (matched by composite header normalization)
     dup_norms = [_norm_key(x) for x in dup_headers_to_highlight if str(x).strip()]
     for want_norm in dup_norms:
         match_cols = set()
@@ -568,9 +520,7 @@ def _write_sheet_data(ws, mapping: List[Dict[str, str]],
                     continue
                 if str(v) in dup_values:
                     cell.fill = YELLOW_DUP_FILL
-
     return nrows, missing
-
 
 def _build_output_bytes(template_bytes: bytes,
                         template_is_xlsm: bool,
@@ -611,13 +561,11 @@ def _build_output_bytes(template_bytes: bytes,
     wb.save(bio_out)  # preserves formatting, heights, colors, validations; keep_vba preserves macros
     return bio_out.getvalue()
 
-
-# ----- ordering / mapping workbook helpers -----
+# ---------- Ordering / matching helpers ----------
 def _ordered_keys(present_sheets: Dict[str, str]) -> List[str]:
     ordered = [k for k in CANON_ORDER if k in present_sheets]
     ordered += [k for k in present_sheets.keys() if k not in ordered]
     return ordered
-
 
 def _match_mapping_tab(sheet_names: List[str], target_key: str) -> Optional[str]:
     candidates = [(_norm_key(n), n) for n in sheet_names]
@@ -631,7 +579,6 @@ def _match_mapping_tab(sheet_names: List[str], target_key: str) -> Optional[str]
             if t in norm or norm in t:
                 return name
     return None
-
 
 # =============================
 # Session bootstrap
@@ -655,17 +602,14 @@ for k, v in [
 ]:
     st.session_state.setdefault(k, v)
 
-
 # =============================
-# Scroll position retention (avoid page jump)
+# Preserve scroll position
 # =============================
 st.components.v1.html(
     """
     <script>
     const KEY = "scrollY";
-    window.addEventListener("beforeunload", () => {
-      sessionStorage.setItem(KEY, window.scrollY);
-    });
+    window.addEventListener("beforeunload", () => { sessionStorage.setItem(KEY, window.scrollY); });
     window.addEventListener("load", () => {
       const y = sessionStorage.getItem(KEY);
       if (y !== null) window.scrollTo(0, parseFloat(y));
@@ -675,38 +619,36 @@ st.components.v1.html(
     height=0,
 )
 
-
 # =============================
 # Tabs
 # =============================
 tab1, tab2, tab3 = st.tabs([
     "Upload Masterfile Template",
     "Upload Raw / Onboarding Data",
-    "Mapping (Horizontal) & Download"
+    "Mapping (Horizontal) & Download",
 ])
 
-
 # -----------------------------
-# Tab 1: Upload Masterfile Template
+# Tab 1: Upload Template
 # -----------------------------
 with tab1:
     st.markdown("#### Step 1 of 3 — Upload Masterfile Template (.xlsx / .xlsm)")
 
-    cols_hdr = st.columns((2, 1))
-    with cols_hdr[0]:
+    c1, c2 = st.columns((2, 1))
+    with c1:
         hdr_str_default = ",".join(str(x) for x in st.session_state.get("header_rows", DEFAULT_HEADER_ROWS))
         hdr_str = st.text_input(
             "Header rows to combine (comma‑separated, top→bottom)",
             value=hdr_str_default,
-            help="Example: 3,4,5 — the app will join the texts in those rows (same column) to form one header."
+            help="Example: 3,4,5 — texts in those rows (same column) are joined to form a composite header."
         )
         st.session_state["header_rows"] = _parse_rows_input(hdr_str, DEFAULT_HEADER_ROWS)
-    with cols_hdr[1]:
-        dsr = st.number_input("Data start row", min_value=2, step=1,
-                              value=st.session_state.get("data_start_row", DEFAULT_DATA_START_ROW))
+    with c2:
+        dsr = st.number_input("Data start row", min_value=2, step=1, value=st.session_state.get("data_start_row", DEFAULT_DATA_START_ROW))
         st.session_state["data_start_row"] = int(dsr)
 
     tpl = st.file_uploader("Upload template", type=["xlsx", "xlsm"], key="template_uploader")
+
     do_rescan = False
     if st.session_state.get("template_bytes"):
         do_rescan = st.button("Re‑scan headers using current rows")
@@ -741,14 +683,14 @@ with tab1:
         st.session_state["pos_to_col_by_sheet"] = pos_to_col_by_sheet
         st.session_state["templ_header_sigs"] = templ_header_sigs
 
-        # Clear only on header signature change per sheet (both live & saved)
+        # Clear live & saved mapping only for sheets whose header signature changed
         for sk, sig in templ_header_sigs.items():
             if prev_sigs.get(sk) != sig:
-                prefix_map = f"map_{sk}_"
-                prefix_tick = f"tick_{sk}_"
-                for k in list(st.session_state.keys()):
-                    if k.startswith(prefix_map) or k.startswith(prefix_tick):
-                        del st.session_state[k]
+                p_map = f"map_{sk}_"
+                p_tick = f"tick_{sk}_"
+                for key in list(st.session_state.keys()):
+                    if key.startswith(p_map) or key.startswith(p_tick):
+                        del st.session_state[key]
                 if sk in st.session_state["saved_mapping"]:
                     del st.session_state["saved_mapping"][sk]
 
@@ -758,18 +700,15 @@ with tab1:
 
         st.success("Template loaded & headers scanned.")
         if present:
-            st.caption(f"Composite headers from rows: {', '.join(str(r) for r in st.session_state['header_rows'])}. "
-                       f"Data writes from row {st.session_state['data_start_row']}.")
+            st.caption(f"Composite headers from rows: {', '.join(str(r) for r in st.session_state['header_rows'])}. Data will be written from row {st.session_state['data_start_row']}.")
             st.write("Detected target sheets:")
             for sk in _ordered_keys(present):
-                display = TARGET_SHEETS_CANON.get(sk, present[sk])
-                st.write(f"- **{display}**")
+                st.write(f"- **{TARGET_SHEETS_CANON.get(sk, present[sk])}** (actual: `{present[sk]}`)")
         else:
             st.warning("No target sheets found. Expected PCSE and/or TIC.")
 
-
 # -----------------------------
-# Tab 2: Upload Raw / Onboarding Data
+# Tab 2: Upload Raw
 # -----------------------------
 with tab2:
     st.markdown("#### Step 2 of 3 — Upload Raw / Onboarding Data (.csv / .xlsx)")
@@ -788,14 +727,12 @@ with tab2:
         new_headers = list(raw_df.columns)
         new_sig = "|".join(new_headers)
 
-        # Clear only selections that reference removed raw headers (live + saved)
         removed = set(st.session_state.get("raw_prev_headers", [])) - set(new_headers)
         if removed:
             for sk in st.session_state.get("present_sheets", {}).keys():
                 for k in list(st.session_state.keys()):
-                    if k.startswith(f"map_{sk}_"):
-                        if st.session_state.get(k, "") in removed:
-                            st.session_state[k] = ""
+                    if k.startswith(f"map_{sk}_") and st.session_state.get(k, "") in removed:
+                        st.session_state[k] = ""
                 if "saved_mapping" in st.session_state and sk in st.session_state["saved_mapping"]:
                     st.session_state["saved_mapping"][sk] = [
                         r for r in st.session_state["saved_mapping"][sk] if r.get("raw_header") not in removed
@@ -809,7 +746,6 @@ with tab2:
         st.success(f"Raw data loaded ({len(raw_df)} rows, {len(new_headers)} columns).")
         with st.expander("Preview (first 20 rows)"):
             st.dataframe(raw_df.head(20), use_container_width=True)
-
 
 # -----------------------------
 # Tab 3: Mapping (Horizontal) & Download
@@ -827,103 +763,110 @@ with tab3:
     present = st.session_state["present_sheets"]
     templ_headers_by_sheet = st.session_state["templ_headers_by_sheet"]
     pos_to_col_by_sheet = st.session_state.get("pos_to_col_by_sheet", {})
-    raw_headers = st.session_state["raw_headers"]
+    raw_headers: List[str] = st.session_state["raw_headers"]
     raw_df: pd.DataFrame = st.session_state["raw_df_payload"]
 
     if not present:
         st.error("Template has no target sheets to map (expected PCSE and/or TIC).")
         st.stop()
 
-    ordered_keys_list = _ordered_keys(present)
-    display_names = [TARGET_SHEETS_CANON.get(sk, present[sk]) for sk in ordered_keys_list]
-    key_by_display = {TARGET_SHEETS_CANON.get(sk, present[sk]): sk for sk in ordered_keys_list}
+    ordered_keys = _ordered_keys(present)
+    display_names = [TARGET_SHEETS_CANON.get(sk, present[sk]) for sk in ordered_keys]
+    key_by_display = { TARGET_SHEETS_CANON.get(sk, present[sk]): sk for sk in ordered_keys }
 
-    # Sheet radio
-    current_key = st.session_state.get("current_sheet_key", ordered_keys_list[0])
-    default_index = display_names.index(TARGET_SHEETS_CANON.get(current_key, present.get(current_key, ""))) \
-        if current_key in present else 0
+    current_key_before = st.session_state.get("current_sheet_key", ordered_keys[0])
+    default_index = 0
+    if current_key_before in present:
+        dname = TARGET_SHEETS_CANON.get(current_key_before, present.get(current_key_before, ""))
+        if dname in display_names:
+            default_index = display_names.index(dname)
+
     selected_display = st.radio("Choose target sheet", options=display_names, index=default_index, horizontal=True)
     sheet_key = key_by_display[selected_display]
+
+    # Auto-save previous sheet mapping when switching
+    if current_key_before != sheet_key and current_key_before in present:
+        _commit_current_sheet_mapping(current_key_before, templ_headers_by_sheet.get(current_key_before, []))
     st.session_state["current_sheet_key"] = sheet_key
 
-    # Prepare preview
-    wb_prev = load_workbook(BytesIO(st.session_state["template_bytes"]),
-                            read_only=False,
-                            keep_vba=(st.session_state["template_ext"] == "xlsm"),
-                            data_only=False)
-    ws_prev = wb_prev[present[sheet_key]]
-
-    # Styled preview (rows 1–6)
-    st.markdown("**Template preview (rows 1–6)**")
-    preview_html = _build_preview_html(ws_prev, max_rows=6)
-    # Heuristic height: sum of row heights + some margin, with cap
-    height_guess = min(560, max(240, sum([22]*6) + 80))
-    st.components.v1.html(preview_html, height=height_guess, scrolling=True)
-
-    # Build composite headers for mapping (using selected header rows)
-    headers_for_map, pos_to_col, _ = _extract_headers_composite(ws_prev, st.session_state["header_rows"])
-    templ_headers_by_sheet[sheet_key] = headers_for_map
-    pos_to_col_by_sheet[sheet_key] = pos_to_col
-    st.session_state["templ_headers_by_sheet"] = templ_headers_by_sheet
-    st.session_state["pos_to_col_by_sheet"] = pos_to_col_by_sheet
+    # Prepare mapping headers for this sheet
+    is_xlsm = (st.session_state.get("template_ext", "xlsx") == "xlsm")
+    wb = load_workbook(BytesIO(st.session_state["template_bytes"]), read_only=False, keep_vba=is_xlsm, data_only=False)
+    ws = wb[present[sheet_key]]
 
     templ_headers = templ_headers_by_sheet.get(sheet_key, [])
+    pos_to_col = pos_to_col_by_sheet.get(sheet_key, {})
+
+    # ---------- High-fidelity header preview (rows 2–6) with NO inner scroll ----------
+    st.markdown("**Template preview (rows 2–6)**")
+    html_preview, exact_height = _build_header_preview_html(ws, start_row=2, num_rows=5, max_cols=None)
+    # Render at the computed height; no inner scrolling -> single page scroll
+    st.components.v1.html(html_preview, height=exact_height + 16, scrolling=False)
+
+    # Hydrate mapping UI from saved snapshot (only fill blanks)
     _hydrate_live_from_saved(sheet_key, templ_headers)
 
-    st.markdown("**Mapping row (choose a raw column for each template column below)**")
+    # ---------- Horizontal mapping row using Data Editor ----------
+    st.markdown("**Mapping row (choose a raw column for each template column)**")
     if not raw_headers:
         st.warning("Upload raw data first to enable mapping.")
     else:
-        # Horizontal one-row editor: a selectbox per column
+        # Build one-row DataFrame: columns are composite headers (display), values are current selections
         options = [""] + raw_headers
         initial = {}
         col_config = {}
         for t, templ_norm, pos, mkey, _ in _iter_template_positions(sheet_key, templ_headers):
-            excel_letter = get_column_letter(pos_to_col.get(pos, 0)) if pos_to_col.get(pos, 0) else ""
-            label = f"{excel_letter} {t}".strip()
+            col_letter = get_column_letter(pos_to_col.get(pos, 0)) if pos_to_col.get(pos, 0) else ""
+            label = f"{col_letter} {t}".strip()
             initial[label] = st.session_state.get(mkey, "")
             col_config[label] = st.column_config.SelectboxColumn(
                 label=label,
                 options=options,
-                required=False
+                required=False,
             )
-        map_df_seed = pd.DataFrame([initial])
+        seed_df = pd.DataFrame([initial]) if initial else pd.DataFrame([{}])
+
         edited_df = st.data_editor(
-            map_df_seed,
+            seed_df,
             column_config=col_config,
             hide_index=True,
             use_container_width=True,
             num_rows="fixed",
-            key=f"map_editor_{sheet_key}"
+            key=f"map_editor_{sheet_key}",
         )
-        # push edits back
-        if isinstance(edited_df, pd.DataFrame) and len(edited_df) >= 1:
+
+        # Push edits back to session_state mapping keys
+        if isinstance(edited_df, pd.DataFrame) and len(edited_df) >= 1 and len(templ_headers) > 0:
             row0 = edited_df.iloc[0].to_dict()
-            # reverse lookup to session keys
-            # row0 keys look like "G Product Identifiers | Product ID"
-            # We'll match by suffix (the composite header text)
+            # Build reverse lookup from editor label -> template header & pos
+            label_to_pos = {}
             for t, templ_norm, pos, mkey, _ in _iter_template_positions(sheet_key, templ_headers):
-                excel_letter = get_column_letter(pos_to_col.get(pos, 0)) if pos_to_col.get(pos, 0) else ""
-                key_label = f"{excel_letter} {t}".strip()
-                new_val = row0.get(key_label, "")
-                if new_val != st.session_state.get(mkey, ""):
-                    st.session_state[mkey] = new_val or ""
-                    if new_val:
-                        _touch_tick(sheet_key, templ_norm, pos)
+                col_letter = get_column_letter(pos_to_col.get(pos, 0)) if pos_to_col.get(pos, 0) else ""
+                label = f"{col_letter} {t}".strip()
+                label_to_pos[label] = (t, templ_norm, pos, mkey)
+            for label, val in row0.items():
+                if label in label_to_pos:
+                    t, templ_norm, pos, mkey = label_to_pos[label]
+                    new_val = "" if (val is None or str(val).strip() == "") else str(val)
+                    if new_val != st.session_state.get(mkey, ""):
+                        st.session_state[mkey] = new_val
+                        if new_val:
+                            _touch_tick(sheet_key, templ_norm, pos)
 
     st.markdown("---")
-    cols_tools = st.columns((1, 1, 1))
-    with cols_tools[0]:
+    # Tools row
+    c1, c2, c3 = st.columns((1, 1, 1))
+    with c1:
         if st.button("Auto‑map (exact)", use_container_width=True):
             _auto_map_exact(sheet_key, templ_headers, raw_headers)
             st.toast("Exact auto‑map applied (blanks only).")
-    with cols_tools[1]:
+    with c2:
         fuzz_thr = st.slider("Fuzzy threshold", 0, 100, 80, 1)
         if st.button("Auto‑map (fuzzy)", use_container_width=True):
             _auto_map_fuzzy(sheet_key, templ_headers, raw_headers, threshold=fuzz_thr)
             st.toast(f"Fuzzy auto‑map applied at threshold {fuzz_thr} (blanks only).")
-    with cols_tools[2]:
-        st.caption("")
+    with c3:
+        st.caption(" ")
 
     st.markdown("---")
     st.markdown("**Import mapping workbook (.xlsx with two tabs: PCSE & TIC)**")
@@ -933,7 +876,7 @@ with tab3:
         try:
             xl = pd.ExcelFile(imp_wb)
             applied_summary = []
-            for sk in ordered_keys_list:
+            for sk in ordered_keys:
                 tab_name = _match_mapping_tab(xl.sheet_names, sk)
                 if not tab_name:
                     applied_summary.append(f"{TARGET_SHEETS_CANON.get(sk, present[sk])}: no matching tab found")
@@ -954,10 +897,10 @@ with tab3:
         mime="text/csv",
         use_container_width=True,
     )
-    export_df_selected = _export_mapping_df(present, templ_headers_by_sheet, pos_to_col_by_sheet, only_sheet_key=sheet_key)
+    export_df_sel = _export_mapping_df(present, templ_headers_by_sheet, pos_to_col_by_sheet, only_sheet_key=sheet_key)
     st.download_button(
         "Export mapping (selected sheet)",
-        data=export_df_selected.to_csv(index=False).encode("utf-8"),
+        data=export_df_sel.to_csv(index=False).encode("utf-8"),
         file_name=f"mapping_export_{TARGET_SHEETS_CANON.get(sheet_key, sheet_key)}.csv",
         mime="text/csv",
         use_container_width=True,
@@ -975,18 +918,16 @@ with tab3:
     )
     dup_cols = [c.strip() for c in dup_cols_text.split(",") if c.strip()]
 
-    tpl_ext = st.session_state.get("template_ext", "xlsx")
-    is_xlsm = (tpl_ext == "xlsm")
     suggested_name = "filled_template.xlsm" if is_xlsm else "filled_template.xlsx"
     file_name_input = st.text_input("Output filename", value=suggested_name)
     final_name = _enforce_extension(file_name_input, is_xlsm=is_xlsm)
 
-    cols_btn = st.columns((1, 1, 1))
-    with cols_btn[0]:
+    b1, b2, b3 = st.columns((1, 1, 1))
+    with b1:
         if st.button("Save mapping (selected sheet)", use_container_width=True):
             _commit_current_sheet_mapping(sheet_key, templ_headers)
             st.success(f"Saved mapping for '{TARGET_SHEETS_CANON.get(sheet_key, present.get(sheet_key, sheet_key))}'.")
-    with cols_btn[1]:
+    with b2:
         if st.button("Save & Build (process both sheets)", use_container_width=True):
             try:
                 _commit_current_sheet_mapping(sheet_key, templ_headers)
@@ -1007,7 +948,7 @@ with tab3:
                 st.error(str(ve))
             except Exception as e:
                 st.error(f"Failed to build file: {e}")
-    with cols_btn[2]:
+    with b3:
         if st.button("Build (selected sheet only)", use_container_width=True):
             try:
                 payload = _build_output_bytes(
@@ -1019,7 +960,7 @@ with tab3:
                     raw_df=raw_df,
                     auto_resolve_dupe_mappings=auto_resolve,
                     dup_columns_to_highlight=dup_cols,
-                    saved_mapping_store=None,  # use live mapping
+                    saved_mapping_store=None,
                 )
                 st.session_state["download_payload"] = payload
                 st.success("File prepared. Use the download button below.")
